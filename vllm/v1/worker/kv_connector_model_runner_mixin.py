@@ -6,7 +6,9 @@ Define KV connector functionality mixin for model runners.
 import copy
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Generator  # noqa: UP035
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any
+
+import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
@@ -73,6 +75,39 @@ class KVConnectorModelRunnerMixin:
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
         return output
+
+    @staticmethod
+    def kv_connector_mm_only_output(
+            scheduler_output: "SchedulerOutput", vllm_config: VllmConfig,
+            mm_metas: Optional[list[Any]]) -> ModelRunnerOutput:
+        # KV send/recv with the results of disaggregated multi-modal encoder.
+        with set_forward_context(
+                None, vllm_config
+        ), KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output, wait_for_save=False) as kv_connector_output:
+            pass
+
+        if (not kv_connector_output.finished_sending
+                and not kv_connector_output.finished_recving and not mm_metas):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        kv_connector_output.registered_mm_metas = mm_metas
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
+
+        return output
+
+    @staticmethod
+    def kv_connector_register_encoder_tensor(
+            req_id: str, tensors: list[torch.Tensor]) -> Optional[list[Any]]:
+        """
+        Register a tensor with the KV connector.
+        This is used to register tensors that are not part of the model output.
+        """
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            assert isinstance(kv_connector, KVConnectorBase)
+            return kv_connector.register_encoder_tensor(req_id, tensors)
 
     @staticmethod
     def maybe_get_kv_connector_output(

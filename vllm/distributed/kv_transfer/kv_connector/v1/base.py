@@ -136,6 +136,21 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def register_encoder_tensor(
+            self, req_id: str,
+            tensors: list[torch.Tensor]) -> Optional[list[Any]]:
+        """
+        Register the encoder tensors to transfer the result of encoder layers.
+
+        Args:
+            req_id (str): the request id.
+            tensors (list[torch.Tensor]): the transfer targets.
+
+        Returns:
+            Metadata of the registered tensors, if any. Saved to kv_connector_output
+        """
+        return
+
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """
         Set the xPU-specific ops for copying KV between host and device.

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Any
 
 import torch
 
@@ -76,6 +76,10 @@ class KVConnectorOutput:
     # [req_ids]
     finished_sending: Optional[set[str]] = None
     finished_recving: Optional[set[str]] = None
+
+    # req_id -> metadata of multi-modal output tensors to be sent
+    # through KV Connector.
+    registered_mm_metas: Optional[dict[str, Any]] = None
 
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.

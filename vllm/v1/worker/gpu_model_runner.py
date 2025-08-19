@@ -150,6 +150,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.uses_mrope = model_config.uses_mrope
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config)
+        self.is_mm_encoder_only_model = vllm_config.kv_transfer_config.is_epd_encoder
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -1136,7 +1137,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return metadata
 
-    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
+    def _calc_encoder_outputs(self, scheduler_output: "SchedulerOutput"):
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
             return
@@ -1188,6 +1189,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
 
+        return encoder_outputs, req_ids_pos
+
+    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
+        encoder_outputs, req_ids_pos = \
+            self._calc_encoder_outputs(scheduler_output)
+
         # Cache the encoder outputs.
         for (req_id, input_id, pos_info), output in zip(
                 req_ids_pos,
@@ -1200,6 +1207,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
+
+    def _execute_and_send_mm_encoder(
+            self,
+            scheduler_output: "SchedulerOutput") -> Optional[dict[str, Any]]:
+        encoder_outputs, req_ids_pos = \
+            self._calc_encoder_outputs(scheduler_output)
+
+        for (req_id, input_id, _), output in zip(
+                req_ids_pos,
+                encoder_outputs,
+        ):
+            if req_id not in self.encoder_cache:
+                self.encoder_cache[req_id] = {}
+
+            self.encoder_cache[req_id][input_id] = output
+
+        mm_metas = {}
+        for req_id, outputs in self.encoder_cache.items():
+            mm_positions = self.requests[req_id].mm_positions
+            cached_encoder_output = self.encoder_cache[req_id]
+
+            all_encoded = all(
+                (i in cached_encoder_output) for i in range(len(mm_positions)))
+
+            if all_encoded:
+                encoder_tensors = [t for _, t in sorted(list(outputs.items()))]
+                mm_metas[req_id] = self.kv_connector_register_encoder_tensor(
+                    req_id, encoder_tensors)
+
+        return mm_metas if mm_metas else None
 
     def _gather_mm_embeddings(
         self,
@@ -1496,6 +1533,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             return self.kv_connector_no_forward(scheduler_output,
                                                 self.vllm_config)
+
+        if self.is_mm_encoder_only_model:
+            mm_metas = self._execute_and_send_mm_encoder(scheduler_output)
+
+            return self.kv_connector_mm_only_output(scheduler_output,
+                                                    self.vllm_config, mm_metas)
 
         # Prepare the decoder inputs.
         (attn_metadata, attention_cuda_graphs, logits_indices,

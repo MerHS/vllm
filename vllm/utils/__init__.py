@@ -176,6 +176,9 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": torch.bfloat16,
     "float": torch.float,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "uint8": torch.uint8,
     "fp8": torch.uint8,
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
@@ -1043,6 +1046,17 @@ def get_kv_cache_torch_dtype(
     else:
         raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
     return torch_dtype
+
+
+def get_dtype_from_str(dtype_str: Union[str, torch.dtype]) -> torch.dtype:
+    """Convert a string representation of a dtype to a torch.dtype."""
+    if isinstance(dtype_str, torch.dtype):
+        return dtype_str
+    elif isinstance(dtype_str, str):
+        if dtype_str in STR_DTYPE_TO_TORCH_DTYPE:
+            return STR_DTYPE_TO_TORCH_DTYPE[dtype_str]
+        else:
+            raise ValueError(f"Invalid dtype string: {dtype_str}")
 
 
 def create_kv_caches_with_random_flash(
