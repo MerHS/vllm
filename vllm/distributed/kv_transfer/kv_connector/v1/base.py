@@ -178,6 +178,29 @@ class KVConnectorBase_V1(ABC):
         pass
 
     @abstractmethod
+    def get_mm_outputs(
+        self,
+        req_mm_ids: dict[str,
+                         list[int]]) -> dict[str, dict[int, torch.Tensor]]:
+        """
+        Pop received multi-modal tokens from the connector.
+
+        Args:
+            req_mm_ids: request id -> encoder input id -> encoded tensor
+        
+        Returns:
+            Received multi-modal tokens
+        """
+        pass
+
+    @abstractmethod
+    def free_encoder_cache(self, req_id: str) -> None:
+        """
+        Free the encoder cache for a request.
+        """
+        pass
+
+    @abstractmethod
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's

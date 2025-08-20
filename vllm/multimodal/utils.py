@@ -286,6 +286,25 @@ class MediaConnector:
 
         return image_embedding_io.load_base64("", data)
 
+    def fetch_raw_tensor(self, data) -> torch.Tensor:
+        """
+        Create a tensor of the given size.
+        """
+        tensor_size = data.size
+        tensor_dtype = data.dtype
+
+        assert isinstance(tensor_size, (list, tuple)), (
+            f"Expected `size` to be a list or tuple, got {type(tensor_size)}.")
+        assert isinstance(tensor_dtype, str), (
+            f"Expected `dtype` to be a string, got {type(tensor_dtype)}.")
+
+        size = [int(x) for x in tensor_size]
+        dtype = getattr(torch, tensor_dtype)
+
+        assert isinstance(dtype, torch.dtype)
+
+        return torch.empty(size, dtype=dtype)
+
 
 def encode_audio_base64(
     audio: np.ndarray,

@@ -349,9 +349,6 @@ class Scheduler(SchedulerInterface):
                     if is_ready:
                         request.status = RequestStatus.WAITING
                     else:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request.request_id)
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
@@ -444,6 +441,15 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
+                kv_transfer_params = request.kv_transfer_params
+                skip_alloc = False
+                if kv_transfer_params is not None:
+                    remote_encode = kv_transfer_params.get(
+                        "do_remote_encode", False)
+                    remote_prefill = kv_transfer_params.get(
+                        "do_remote_prefill", False)
+                    skip_alloc = remote_encode and not remote_prefill
+
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an
                 # extra block gets allocated which
@@ -452,19 +458,22 @@ class Scheduler(SchedulerInterface):
                 effective_lookahead_tokens = (0 if request.num_computed_tokens
                                               == 0 else
                                               self.num_lookahead_tokens)
+                if skip_alloc:
+                    conn_blocks = new_computed_blocks
+                else:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens + num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        delay_cache_blocks=load_kv_async,
+                    )
+                    conn_blocks = new_computed_blocks + new_blocks
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    delay_cache_blocks=load_kv_async,
-                )
-
-                if new_blocks is None:
-                    # The request cannot be scheduled.
-                    break
+                    if new_blocks is None:
+                        # The request cannot be scheduled.
+                        break
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -473,14 +482,15 @@ class Scheduler(SchedulerInterface):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        new_computed_blocks + new_blocks,
+                        conn_blocks,
                         num_external_computed_tokens,
                     )
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
                 request = self.waiting.pop_request()
-                if load_kv_async:
+
+                if load_kv_async or skip_alloc:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
@@ -807,12 +817,21 @@ class Scheduler(SchedulerInterface):
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
 
+            delay_free_encode = self.is_epd_encoder
+            kv_transfer_params = request.kv_transfer_params
+            if kv_transfer_params is not None:
+                delay_free_encode = delay_free_encode or kv_transfer_params.get(
+                    "do_remote_encode", False)
+
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative
             # decoding. However, it is safe to call the method here because
             # encoder inputs are always part of the prompt, not the output,
             # and thus are unaffected by speculative decoding.
-            if request.has_encoder_inputs:
+            #
+            # If the schduler is for EPD-disaggregation, delay free until
+            # the connector finishes sending.
+            if not delay_free_encode and request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
         # Clear the finished request IDs.
@@ -963,7 +982,6 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
-        registered_mm_metas = model_runner_output.kv_connector_output.registered_mm_metas
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
@@ -983,12 +1001,12 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if self.is_epd_encoder:
-                # TODO: check that this is safe whether new_token_ids is empty
-
                 # stop if num_computed_tokens reaches the end of input tokens
                 stopped = request.num_computed_tokens >= request.num_tokens
 
                 if stopped:
+                    registered_mm_metas = model_runner_output.kv_connector_output.registered_mm_metas
+
                     status_before_stop = request.status
                     request.status = RequestStatus.FINISHED_LENGTH_CAPPED
                     kv_transfer_params = self._free_request(request)
@@ -997,8 +1015,6 @@ class Scheduler(SchedulerInterface):
                     kv_transfer_params[
                         "remote_mm_metas"] = registered_mm_metas[req_id]
 
-                    logger.debug("result of _free_request: %s",
-                                 kv_transfer_params)
                     if status_before_stop == RequestStatus.RUNNING:
                         stopped_running_reqs.add(request)
                     else:
@@ -1014,7 +1030,9 @@ class Scheduler(SchedulerInterface):
                             kv_transfer_params=kv_transfer_params,
                             num_cached_tokens=request.num_cached_tokens,
                         ))
-                    continue
+                continue
+
+            # Problem: if not stopped -> big problem.
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[
@@ -1253,7 +1271,8 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
-        self.encoder_cache_manager.free(request)
+        if not self.is_epd_encoder:
+            self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
@@ -1353,6 +1372,15 @@ class Scheduler(SchedulerInterface):
         if request.request_id not in self.finished_recving_kv_req_ids:
             return False
 
+        # TODO: check both do_remote_prefill and encode is True
+        if request.kv_transfer_params is not None:
+            remote_encode = request.kv_transfer_params.get(
+                "do_remote_encode", False)
+            if remote_encode:
+                request.kv_transfer_params["do_remote_encode"] = False
+                self.finished_recving_kv_req_ids.remove(request.request_id)
+            return True
+
         # Now that the blocks are ready, actually cache them.
         (block_ids, ) = self.kv_cache_manager.get_block_ids(request.request_id)
         num_computed_tokens = len(block_ids) * self.block_size
@@ -1391,4 +1419,6 @@ class Scheduler(SchedulerInterface):
             self.finished_recving_kv_req_ids.add(req_id)
         for req_id in (kv_connector_output.finished_sending or ()):
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            if self.is_epd_encoder:
+                self.encoder_cache_manager.free(self.requests[req_id])
             self._free_blocks(self.requests[req_id])

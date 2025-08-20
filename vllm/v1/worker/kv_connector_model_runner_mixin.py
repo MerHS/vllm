@@ -138,6 +138,7 @@ class KVConnectorModelRunnerMixin:
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         kv_connector.start_load_kv(get_forward_context())
+
         try:
             yield output
         finally:
@@ -148,3 +149,22 @@ class KVConnectorModelRunnerMixin:
                 kv_connector.get_finished(scheduler_output.finished_req_ids))
 
             kv_connector.clear_connector_metadata()
+
+    @staticmethod
+    def maybe_get_kv_connector_encoder_outputs(
+        req_mm_ids: dict[str, list[int]]
+    ) -> Optional[dict[str, dict[int, torch.Tensor]]]:
+        """
+        Pop received encoder tokens from the connector.
+        """
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            assert isinstance(kv_connector, KVConnectorBase)
+            return kv_connector.get_mm_outputs(req_mm_ids)
+
+    @staticmethod
+    def free_connector_encoder_cache(req_id: str) -> None:
+        if has_kv_transfer_group():
+            kv_connector = get_kv_transfer_group()
+            assert isinstance(kv_connector, KVConnectorBase)
+            kv_connector.free_encoder_cache(req_id)

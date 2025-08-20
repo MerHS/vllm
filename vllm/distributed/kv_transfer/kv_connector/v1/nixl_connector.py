@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import base64
 import contextlib
 import logging
 import math
@@ -7,6 +8,7 @@ import queue
 import threading
 import time
 import uuid
+import zlib
 from itertools import chain
 from collections import defaultdict
 from collections.abc import Iterator
@@ -84,12 +86,15 @@ class MMTensorMeta:
     shape: list[int]
 
 
+RemoteMMMetas = tuple[str, list[MMTensorMeta]]
+
+
 @dataclass
 class ReqMeta:
     local_block_ids: list[int]
     remote_block_ids: list[int]
-    local_mm_ids: Optional[list[int]]
-    remote_mm_metas: Optional[list[MMTensorMeta]]
+    # NIXL partial metadata & register list
+    remote_mm_metas: Optional[RemoteMMMetas]
     remote_host: str
     remote_port: int
     remote_engine_id: str
@@ -104,7 +109,6 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_send: dict[ReqId, float] = {}
 
         self.reqs_to_recv_mm: dict[ReqId, ReqMeta] = {}
-        self.reqs_to_send_mm: dict[ReqId, float] = {}
 
     def add_new_req(
         self,
@@ -113,13 +117,12 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
         save_to_host: bool = False,
-        remote_mm_metas: Optional[list[MMTensorMeta]] = None,
+        remote_mm_metas: Optional[RemoteMMMetas] = None,
     ):
         # save and load are mutually exclusive
         assert load_remote_cache ^ save_to_host
         _req = ReqMeta(
             local_block_ids=local_block_ids,
-            local_mm_ids=kv_transfer_params.get("local_mm_ids", None),
             remote_block_ids=kv_transfer_params["remote_block_ids"],
             remote_mm_metas=remote_mm_metas,
             remote_engine_id=kv_transfer_params["remote_engine_id"],
@@ -234,6 +237,16 @@ class NixlConnector(KVConnectorBase_V1):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
+    def get_mm_outputs(
+        self, req_mm_ids: dict[ReqId, list[int]]
+    ) -> dict[ReqId, dict[int, torch.Tensor]]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_mm_outputs(req_mm_ids)
+
+    def free_encoder_cache(self, req_id: ReqId) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.free_encoder_cache(req_id)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         """NixlConnector does not do layerwise saving."""
         pass
@@ -276,8 +289,8 @@ class NixlConnectorScheduler:
         self._reqs_need_send: dict[ReqId, float] = {}
 
         # Encoder-related requests
-        # int list indicated multi-modal input indices that need to be recv.
-        self._reqs_need_recv_mm: dict[ReqId, tuple[Request, list[int]]] = {}
+        self._reqs_need_recv_mm: dict[ReqId, tuple[Request,
+                                                   RemoteMMMetas]] = {}
         self.is_encoder_only = vllm_config.kv_transfer_config.is_epd_encoder
 
     def get_num_new_matched_tokens(
@@ -362,24 +375,30 @@ class NixlConnectorScheduler:
             params["do_remote_prefill"] = False
         elif params.get("do_remote_encode"):
             remote_mm_metas = params.get("remote_mm_metas", None)
+            mm_recv_triggered = params.get("mm_recv_triggered", False)
 
-            # TODO: currently whole multi-modal inputs will be received
-            # at once. by adding parameter `encoder_inputs_to_schedule`
-            # would allow receiving only scheduled encoder inputs
-            if remote_mm_metas:
+            # NOTE: Contrary to prefill, we constantly check do_remote_encode
+            # in the scheduler, so we won't set it False to trigger MM transfer once.
+            if remote_mm_metas and not mm_recv_triggered:
                 if all(p in params
                        for p in ("remote_engine_id", "remote_host",
                                  "remote_port", "remote_mm_metas")):
 
-                    mm_metas = params.get("remote_mm_metas")
-                    self._reqs_need_recv_mm[request.request_id] = (request,
-                                                                   mm_metas)
+                    remote_agent_str, mm_metas = params.get("remote_mm_metas")
+
+                    mm_metas = [MMTensorMeta(**p) for p in mm_metas]
+                    self._reqs_need_recv_mm[request.request_id] = (request, (
+                        remote_agent_str, mm_metas))
+
+                    # remove agent metadata from debug logging
+                    params['remote_mm_metas'] = (None, mm_metas)
                 else:
                     logger.warning(
                         "Got invalid KVTransferParams: %s. This "
                         "request will not utilize KVTransfer", params)
-            # Only trigger 1 KV transfer per request.
-            params["do_remote_encode"] = False
+
+            # Only trigger 1 MM transfer per request.
+            params["mm_recv_triggered"] = True
 
     def build_connector_meta(
         self,
@@ -561,8 +580,9 @@ class NixlConnectorWorker:
         self.dst_xfer_side_handles: dict[EngineId, int] = {}
 
         self._registered_mm_descs: dict[ReqId, Any] = {}
+        self._mm_recv_target_tensors: dict[ReqId, list[torch.Tensor]] = {}
         self.src_xfer_side_mm_handle: dict[ReqId, int] = {}
-        self.dst_xfer_side_mm_handles: dict[EngineId, dict[ReqId, int]] = {}
+        self.dst_xfer_side_mm_handle: dict[ReqId, int] = {}
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -897,6 +917,7 @@ class NixlConnectorWorker:
         logger.debug("Created %s blocks for src engine %s and rank %s",
                      len(blocks_data), self.engine_id, self.tp_rank)
 
+        logger.debug("Registering local xfer descs: %s", blocks_data[:10])
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
                                                  self.nixl_memory_type)
         # NIXL_INIT_AGENT to be used for preparations of local descs.
@@ -920,9 +941,10 @@ class NixlConnectorWorker:
         self._nixl_handshake_listener_t.start()
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
 
-    def register_encoder_tensor(
-            self, req_id: ReqId,
-            tensors: list[torch.Tensor]) -> list[MMTensorMeta]:
+    def register_encoder_tensor(self,
+                                request_id: ReqId,
+                                tensors: list[torch.Tensor],
+                                is_local: bool = False) -> RemoteMMMetas:
         metas = []
         caches_data = []
         blocks_data = []
@@ -931,31 +953,39 @@ class NixlConnectorWorker:
                 continue
             assert tensor.is_contiguous(
             ), "Encoder tensors must be contiguous."
+
             addr = tensor.data_ptr()
             tensor_size = tensor.numel() * tensor.element_size()
             caches_data.append((addr, tensor_size, self.tp_rank, ""))
             blocks_data.append((addr, tensor_size, self.tp_rank))
-
             dtype_str = str(tensor.dtype).replace("torch.", "")
+
             meta = MMTensorMeta(input_id=idx,
                                 base_addr=addr,
                                 dtype_str=dtype_str,
                                 shape=list(tensor.shape))
+
+            logger.debug("Registering mm tensor %s", meta)
             metas.append(meta)
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data,
                                                 self.nixl_memory_type)
         logger.debug("Registering encoder descs: %s", caches_data)
         self.nixl_wrapper.register_memory(descs)
+
         logger.debug("Done registering encoder descs")
-        self._registered_mm_descs[req_id] = descs
+        self._registered_mm_descs[request_id] = descs
 
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data,
-                                                 self.nixl_memory_type)
-        self.src_xfer_side_mm_handle[req_id] = \
-            self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+        if is_local:
+            local_descs = self.nixl_wrapper.get_xfer_descs(
+                blocks_data, self.nixl_memory_type)
+            self.src_xfer_side_mm_handle[request_id] = \
+                self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", local_descs)
 
-        return metas
+        agent_meta = self.nixl_wrapper.get_partial_agent_metadata(descs, True)
+        meta_str = base64.b64encode(zlib.compress(agent_meta)).decode("utf-8")
+
+        return meta_str, metas
 
     def add_remote_agent(self,
                          nixl_agent_meta: NixlAgentMetadata,
@@ -1154,6 +1184,29 @@ class NixlConnectorWorker:
 
         return done_sending, done_recving
 
+    def free_encoder_cache(self, req_id: str) -> None:
+        """
+        Free the encoder cache for a request.
+        """
+        logger.debug("Freeing encoder cache for request %s", req_id)
+
+        if req_id in self._mm_recv_target_tensors:
+            del self._mm_recv_target_tensors[req_id]
+
+        local_handle = self.src_xfer_side_mm_handle.get(req_id, None)
+        if local_handle is not None:
+            self.nixl_wrapper.release_dlist_handle(local_handle)
+            del self.src_xfer_side_mm_handle[req_id]
+
+        local_handle = self.dst_xfer_side_mm_handle.get(req_id, None)
+        if local_handle is not None:
+            self.nixl_wrapper.release_dlist_handle(local_handle)
+            del self.dst_xfer_side_mm_handle[req_id]
+
+        reg_desc = self._registered_mm_descs[req_id]
+        self.nixl_wrapper.deregister_memory(reg_desc)
+        del self._registered_mm_descs[req_id]
+
     def _get_new_notifs(self) -> set[str]:
         """
         Get req_ids which got a remote xfer message. When multiple consumers
@@ -1215,13 +1268,14 @@ class NixlConnectorWorker:
         for req_id, meta in chain(metadata.reqs_to_recv.items(),
                                   metadata.reqs_to_recv_mm.items()):
             remote_engine_id = meta.remote_engine_id
+            mm_metas = meta.remote_mm_metas[1] if meta.remote_mm_metas else []
+
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
                 "Num local_block_ids: %s. Num remote_block_ids: %s. "
-                "Num local_mm_ids: %s. Num remote_mm_metas: %s", req_id,
-                remote_engine_id, len(meta.local_block_ids),
-                len(meta.remote_block_ids), len(meta.local_mm_ids),
-                len(meta.remote_mm_metas))
+                "Num remote_mm_metas: %s.", req_id, remote_engine_id,
+                len(meta.local_block_ids), len(meta.remote_block_ids),
+                len(mm_metas))
             if self.use_host_buffer:
                 self._recving_metadata[req_id] = meta
             if remote_engine_id not in self._remote_agents:
@@ -1246,18 +1300,17 @@ class NixlConnectorWorker:
         logger.debug(
             "Remote agent %s available, calling _read_blocks for req %s",
             meta.remote_engine_id, req_id)
-        if meta.local_mm_ids and meta.remote_mm_metas:
-            # Read encoder tensors.
-            self._read_encoder_tensors(meta.local_mm_ids, meta.remote_mm_metas,
-                                       meta.remote_engine_id, req_id)
-            return
 
-        self._read_blocks(
-            request_id=req_id,
-            dst_engine_id=meta.remote_engine_id,
-            local_block_ids=meta.local_block_ids,
-            remote_block_ids=meta.remote_block_ids,
-        )
+        if meta.remote_mm_metas:
+            self._read_encoder_tensors(meta.remote_mm_metas,
+                                       meta.remote_engine_id, req_id)
+        else:
+            self._read_blocks(
+                request_id=req_id,
+                dst_engine_id=meta.remote_engine_id,
+                local_block_ids=meta.local_block_ids,
+                remote_block_ids=meta.remote_block_ids,
+            )
 
     def _read_blocks(self, local_block_ids: list[int],
                      remote_block_ids: list[int], dst_engine_id: str,
@@ -1355,27 +1408,52 @@ class NixlConnectorWorker:
         self._recving_transfers[request_id].append(
             (handle, time.perf_counter()))
 
-    def _read_encoder_tensors(self, local_mm_ids: list[int],
-                              remote_mm_metas: list[MMTensorMeta],
+    def _alloc_and_reg_encoder_tensors(self, request_id: str,
+                                       mm_metas: list[MMTensorMeta]):
+        mm_tensors = []
+        for meta in mm_metas:
+            dtype = get_dtype_from_str(meta.dtype_str)
+
+            tensor = torch.empty(meta.shape,
+                                 dtype=dtype,
+                                 device=current_platform.device_name)
+            mm_tensors.append(tensor)
+
+        self._mm_recv_target_tensors[request_id] = mm_tensors
+        self.register_encoder_tensor(request_id, mm_tensors, True)
+
+    def _read_encoder_tensors(self, remote_mm_metas: RemoteMMMetas,
                               dst_engine_id: str, request_id: str):
-        """ Read encoder tensors from remote engine."""
+        """Read encoder tensors from remote engine."""
+
+        agent_meta_str, mm_metas = remote_mm_metas
+        agent_meta = zlib.decompress(
+            base64.b64decode(agent_meta_str.encode("utf-8")))
+
+        self._alloc_and_reg_encoder_tensors(request_id, mm_metas)
 
         # TODO: set remote_tp_rank to the remote engine's tp rank.
         remote_rank = 0
         remote_agent_name = self._remote_agents[dst_engine_id][remote_rank]
+
+        self.nixl_wrapper.add_remote_agent(agent_meta)
+
+        # TODO: support multiple remote encoder agents
         notif_id = f"{request_id}:1".encode()
 
-        assert len(local_mm_ids) == len(remote_mm_metas)
-
         remote_blocks_data = []
-        remote_mm_ids = []
-        for meta in remote_mm_metas:
-            # For each remote tensor, prepare the blocks data.
-            addr = meta.addr
-            tensor_size = meta.get_tensor_size()
+        mm_ids = []
+        tensors = self._mm_recv_target_tensors[request_id]
+        for meta, tensor in zip(mm_metas, tensors):
+
+            addr = meta.base_addr
+            tensor_size = tensor.numel() * tensor.element_size()
+
+            logger.debug("Preparing mm tensor %s, size: %s - %s", meta,
+                         tensor_size, remote_rank)
 
             remote_blocks_data.append((addr, tensor_size, remote_rank))
-            remote_mm_ids.append(meta.input_id)
+            mm_ids.append(meta.input_id)
 
         remote_descs = self.nixl_wrapper.get_xfer_descs(
             remote_blocks_data, self.nixl_memory_type)
@@ -1384,12 +1462,14 @@ class NixlConnectorWorker:
         remote_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
             remote_agent_name, remote_descs)
 
+        self.dst_xfer_side_mm_handle[request_id] = remote_xfer_side_handle
+
         handle = self.nixl_wrapper.make_prepped_xfer(
             "READ",
             local_xfer_side_handle,
-            local_mm_ids,
+            mm_ids,
             remote_xfer_side_handle,
-            remote_mm_ids,
+            mm_ids,
             notif_msg=notif_id,
         )
 
@@ -1397,6 +1477,23 @@ class NixlConnectorWorker:
 
         self._recving_transfers[request_id].append(
             (handle, time.perf_counter()))
+
+        logger.debug(
+            "Remote agent %s available, calling _read_encoder_tensors for req %s",
+            remote_agent_name, request_id)
+
+    def get_mm_outputs(
+        self, req_mm_ids: dict[ReqId, list[int]]
+    ) -> dict[ReqId, dict[int, torch.Tensor]]:
+        mm_dict = {}
+        for req_id, mm_ids in req_mm_ids.items():
+            if req_id not in self._mm_recv_target_tensors:
+                continue
+
+            mm_tensors = self._mm_recv_target_tensors[req_id]
+            mm_dict[req_id] = {mm_id: mm_tensors[mm_id] for mm_id in mm_ids}
+
+        return mm_dict
 
     def _get_block_descs_ids(self,
                              engine_id: str,

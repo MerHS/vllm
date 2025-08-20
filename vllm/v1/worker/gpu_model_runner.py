@@ -421,6 +421,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
+
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -437,6 +438,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 encoder_outputs.pop(input_id, None)
                 if not encoder_outputs:
                     self.encoder_cache.pop(req_id, None)
+
+        # delayed encoder cache free in EPD-disaggregation
+        if self.is_mm_encoder_only_model:
+            freed_req_ids = set([
+                req_id for req_id, _ in scheduler_output.free_encoder_input_ids
+            ])
+            for req_id in freed_req_ids:
+                self.free_connector_encoder_cache(req_id)
 
         # Remove the unscheduled requests from the persistent batch.
         # NOTE(woosuk): The unscheduled requests are either preempted requests
@@ -1140,18 +1149,41 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _calc_encoder_outputs(self, scheduler_output: "SchedulerOutput"):
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
-            return
+            return None, None
+
+        # only the requests do_remote_encode is enabled will be returned
+        remote_encoder_outputs = self.maybe_get_kv_connector_encoder_outputs(
+            scheduled_encoder_inputs)
 
         # Batch the multi-modal inputs.
         mm_inputs = list[MultiModalKwargs]()
         req_ids_pos = list[tuple[str, int, PlaceholderRange]]()
+        req_ids_pos_remote = list[tuple[str, int, PlaceholderRange]]()
+        remote_outputs = []
+
         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
             req_state = self.requests[req_id]
 
             for mm_input_id in encoder_input_ids:
+                ids_pos = (req_id, mm_input_id,
+                           req_state.mm_positions[mm_input_id])
+
+                # filter out remotely encoded tokens
+                if remote_encoder_outputs and req_id in remote_encoder_outputs:
+                    mm_outputs = remote_encoder_outputs[req_id]
+                    if mm_input_id in mm_outputs:
+                        req_ids_pos_remote.append(ids_pos)
+                        remote_outputs.append(mm_outputs[mm_input_id])
+                        continue
+
                 mm_inputs.append(req_state.mm_inputs[mm_input_id])
-                req_ids_pos.append(
-                    (req_id, mm_input_id, req_state.mm_positions[mm_input_id]))
+                req_ids_pos.append(ids_pos)
+
+        # all the mm outputs are received
+        if len(mm_inputs) == 0:
+            logger.debug("all the mm outputs are received of request %s",
+                         req_ids_pos_remote)
+            return remote_outputs, req_ids_pos_remote
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -1189,12 +1221,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
 
+        encoder_outputs.extend(remote_outputs)
+        req_ids_pos.extend(req_ids_pos_remote)
+
         return encoder_outputs, req_ids_pos
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         encoder_outputs, req_ids_pos = \
             self._calc_encoder_outputs(scheduler_output)
 
+        if encoder_outputs is None:
+            return
         # Cache the encoder outputs.
         for (req_id, input_id, pos_info), output in zip(
                 req_ids_pos,
@@ -1231,6 +1268,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             all_encoded = all(
                 (i in cached_encoder_output) for i in range(len(mm_positions)))
 
+            # TODO: This requires every modality input must be encoded before
+            # the encoded tensors are ready to send. This can make a problem
+            # if the encoder budget is only filled with partial modalities.
             if all_encoded:
                 encoder_tensors = [t for _, t in sorted(list(outputs.items()))]
                 mm_metas[req_id] = self.kv_connector_register_encoder_tensor(
