@@ -29,12 +29,9 @@ async def get_or_create_session():
             limit=100,  # Total connection pool size
             limit_per_host=30,  # Per-host connection limit
             keepalive_timeout=30,  # Keep connections alive for 30s
-            enable_cleanup_closed=True
-        )
-        session = aiohttp.ClientSession(
-            timeout=AIOHTTP_TIMEOUT,
-            connector=connector
-        )
+            enable_cleanup_closed=True)
+        session = aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT,
+                                        connector=connector)
     return session
 
 
@@ -76,7 +73,12 @@ async def handle_request():
                             image_url["url"] = encode_image_base64_from_url(
                                 image_url=url)
 
-        encode_request = original_request_data.copy()
+        max_tokens = original_request_data.get('max_tokens', None)
+        stream = original_request_data.get('stream', None)
+        stream_options = original_request_data.get('stream_options', None)
+
+        encode_request = original_request_data
+
         # change max_tokens = 1 to let it only do prefill
         encode_request["max_tokens"] = 1
         encode_request["kv_transfer_params"] = {"do_remote_decode": True}
@@ -96,8 +98,11 @@ async def handle_request():
         encode_response_json = json.loads(encode_response_data.decode('utf-8'))
         kv_transfer_params = encode_response_json.get('kv_transfer_params', {})
 
-        # Add kv_transfer_params to the decode request
-        decode_request = original_request_data.copy()
+        decode_request = original_request_data
+        decode_request['max_tokens'] = max_tokens
+        decode_request['stream'] = stream
+        decode_request['stream_options'] = stream_options
+
         if kv_transfer_params:
             decode_request["kv_transfer_params"] = kv_transfer_params
 
