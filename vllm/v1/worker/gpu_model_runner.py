@@ -1149,7 +1149,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _calc_encoder_outputs(self, scheduler_output: "SchedulerOutput"):
         scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
         if not scheduled_encoder_inputs:
-            return None, None
+            return [], []
 
         # only the requests do_remote_encode is enabled will be returned
         remote_encoder_outputs = self.maybe_get_kv_connector_encoder_outputs(

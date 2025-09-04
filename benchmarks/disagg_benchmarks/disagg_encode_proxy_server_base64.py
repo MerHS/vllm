@@ -18,24 +18,36 @@ CACHE_IMAGE = False
 
 app = Quart(__name__)
 
+# Global session for connection reuse
+session = None
+
+
+async def get_or_create_session():
+    global session
+    if session is None:
+        connector = aiohttp.TCPConnector(
+            limit=100,  # Total connection pool size
+            limit_per_host=30,  # Per-host connection limit
+            keepalive_timeout=30,  # Keep connections alive for 30s
+            enable_cleanup_closed=True
+        )
+        session = aiohttp.ClientSession(
+            timeout=AIOHTTP_TIMEOUT,
+            connector=connector
+        )
+    return session
+
 
 async def forward_request(url, data, req_id):
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        headers = {
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-            "x-request-id": req_id,
-        }
-        async with session.post(url=url, json=data,
-                                headers=headers) as response:
-            if response.status == 200:
-                # if response.headers.get('Transfer-Encoding') == 'chunked':
-                if True:
-                    async for chunk_bytes in response.content.iter_chunked(
-                            1024):
-                        yield chunk_bytes
-                else:
-                    content = await response.read()
-                    yield content
+    session = await get_or_create_session()
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        "x-request-id": req_id,
+    }
+    async with session.post(url=url, json=data, headers=headers) as response:
+        if response.status == 200:
+            async for chunk_bytes in response.content.iter_chunked(1024):
+                yield chunk_bytes
 
 
 def encode_image_base64_from_url(image_url: str) -> str:
@@ -104,6 +116,20 @@ async def handle_request():
         print("Error occurred in disagg prefill proxy server")
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
+
+
+@app.before_serving
+async def startup():
+    # Initialize the session on startup
+    await get_or_create_session()
+
+
+@app.after_serving
+async def cleanup():
+    # Clean up the session on shutdown
+    global session
+    if session:
+        await session.close()
 
 
 if __name__ == "__main__":
