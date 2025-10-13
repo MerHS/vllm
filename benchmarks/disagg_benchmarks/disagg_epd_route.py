@@ -1,405 +1,523 @@
-# api_proxy.py
+#!/usr/bin/env python3
+"""
+disagg_encoder_proxy.py
+
+Proxy that routes OpenAI-compatible “/v1/chat/completions” requests to two
+clusters:
+  • encode  (multimodal feature extraction)
+  • decode  (language-model inference)
+
+For MM input we:
+    1. Extract *every* image/audio item.
+    2. Fire N concurrent requests to the encoder cluster
+       (one request per item, with **all text removed**).
+    3. Wait for all of them to succeed.
+    4. Forward the *original* request to a decode server.
+
+Usage
+For E + PD setup:
+$ python disagg_encoder_proxy.py \
+      --encode-servers-urls "http://e1:8001,http://e2:8002" \
+      --prefill-servers-urls "disable" \
+      --decode-servers-urls "http://pd1:8003,http://pd2:8004"
+
+For E + P + D setup:
+$ python disagg_encoder_proxy.py \
+      --encode-servers-urls "http://e1:8001,http://e2:8001" \
+      --prefill-servers-urls "http://p1:8003,http://p2:8004" \ 
+      --decode-servers-urls "http://d1:8005,http://d2:8006"
+"""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
 import json
-import time
-import uuid
-from typing import AsyncIterator, Optional, Dict, Any
-from fastapi import FastAPI, Request, HTTPException
-import aiohttp
-from fastapi.responses import StreamingResponse, JSONResponse
-import uvicorn
-import argparse
 import logging
+import os
 import random
+import uuid
+import copy
+from typing import Any, AsyncIterator, List, Optional
+import aiohttp
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+###############################################################################
+# FastAPI app & global state
+###############################################################################
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("proxy")
 
 app = FastAPI()
-
 encode_session: Optional[aiohttp.ClientSession] = None
+prefill_session: Optional[aiohttp.ClientSession] = None
 decode_session: Optional[aiohttp.ClientSession] = None
+
+###############################################################################
+# Utils
+###############################################################################
+
+
+MM_TYPES = {"image_url", "audio_url", "input_audio"}
+
+
+def extract_mm_items(request_data: dict) -> List[dict]:
+    """
+    Return *all* image/audio items that appear anywhere in `messages`.
+
+    Each returned dict looks like:
+        { "type": "image_url", "image_url": {...} }
+    """
+    items: List[dict] = []
+    for msg in request_data.get("messages", []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if item.get("type") in MM_TYPES:
+                items.append(item)
+    return items
+
+
+async def fanout_encoder_primer(
+    orig_request: dict,
+    e_url: str,
+    request_id: str,
+) -> dict:
+    """
+    1. Build one request *per MM item* with all text removed.
+    2. Send them concurrently to the encode cluster.
+    3. Raise if any of them fails.
+    """
+    mm_items = extract_mm_items(orig_request)
+    if not mm_items:
+        return {
+            'do_remote_encode': False,
+            'do_remote_prefill': False,
+            'do_remote_decode': True,
+        }
+
+    headers = {"x-request-id": request_id}
+
+    encoder_req = {
+        # You *may* need to keep additional fields
+        "model": orig_request.get("model"),
+        "messages": [
+            {"role": "user", "content": mm_items},
+        ],
+        # Only need 1 token so the server actually runs the encoder path
+        "max_tokens": 1,
+        "stream": False,
+        "kv_transfer_params": {"do_remote_decode": True},
+    }
+
+    result = await encode_session.post(
+        f"{e_url}/v1/chat/completions",
+        json=encoder_req,
+        headers=headers,
+    )
+
+    if isinstance(result, Exception):
+        logger.error("Encoder request raised: %s", result)
+        raise HTTPException(status_code=502, detail=str(result))
+    if result.status != 200:
+        try:
+            detail = await result.text()
+        except Exception:
+            detail = "<unable to read body>"
+        logger.error("Encoder request returned %s: %s", result.status, detail)
+        raise HTTPException(
+            status_code=result.status,
+            detail=f"Encoder request failed: {detail}",
+        )
+    
+    encoder_json = await result.json()
+    kv_transfer_params = encoder_json.get('kv_transfer_params', {})
+
+    kv_transfer_params['do_remote_decode'] = True
+    
+    return kv_transfer_params
+
+
+
+async def maybe_prefill(
+    req_data: dict,
+    kv_params: dict,
+    p_url: str,
+    req_id: str,
+) -> dict:
+    """
+    - Do prefill-only task if p_url exist; 
+    - Return modified request data with kv transfer params (for nixl connector)
+    - Else, skip and return the original request data for decode
+    """
+    if p_url:
+        prefill_response = await process_prefill_stage(
+            req_data, kv_params, p_url, req_id
+        )
+        # for nixl connector to facilitate kv transfer...
+        prefill_response_json = await prefill_response.json()
+        kv_transfer_params = prefill_response_json.get('kv_transfer_params', {})
+        if kv_transfer_params:
+            req_data["kv_transfer_params"] = kv_transfer_params
+            logger.debug("kv_transfer_params: %s", kv_transfer_params)
+
+        return req_data
+    else:
+        return req_data
+
+
+async def process_prefill_stage(
+    req_data: dict,
+    kv_params: dict,
+    p_url: str,
+    req_id: str,
+) -> dict:
+    """Process request through Prefill stage and return kv_transfer_params"""
+    logger.debug(f"Processing through prefill for req_id: {req_id}/ url: {p_url}")
+
+    stream = req_data.get("stream", None)
+    max_tokens = req_data.get("max_tokens", None)
+    max_completion_tokens = req_data.get("max_completion_tokens", None)
+    stream_options = req_data.get("stream_options", None)
+    
+    # prefill_request = req_data.copy()
+
+    prefill_request = req_data
+    prefill_request['kv_transfer_params'] = kv_params
+
+    prefill_request["stream"] = False
+    prefill_request["max_tokens"] = 1
+    if "max_completion_tokens" in prefill_request:
+        prefill_request["max_completion_tokens"] = 1
+    if "stream_options" in prefill_request:
+        del prefill_request["stream_options"]
+    
+    headers = {"x-request-id": req_id}
+    try:
+        prefill_response = await prefill_session.post(
+            f"{p_url}/v1/chat/completions",
+            json=prefill_request,
+            headers=headers
+        )
+        prefill_response.raise_for_status()
+
+        if prefill_response.status != 200:
+            error_text = await prefill_response.text()
+            raise HTTPException(
+                status_code=prefill_response.status,
+                detail={"error": "Prefill request failed", "message": error_text}
+            )
+        logger.debug(f"Prefill processing completed successfully for req_id: {req_id}")
+
+        req_data['stream'] = stream
+        req_data['max_tokens'] = max_tokens
+        req_data['max_completion_tokens'] = max_completion_tokens
+        req_data['stream_options'] = stream_options
+        
+        return prefill_response
+
+    except Exception as e:
+        logger.error(f"Prefill processing failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Prefill processing error", "message": str(e)}
+        )
+
+
+###############################################################################
+# FastAPI lifecycle
+###############################################################################
 
 
 @app.on_event("startup")
-async def startup_event():
-    global encode_session, decode_session
-    encode_session = aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=0),
-        timeout=aiohttp.ClientTimeout(total=100000))
-    decode_session = aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=0),
-        timeout=aiohttp.ClientTimeout(total=100000))
+async def on_startup() -> None:
+    global encode_session, prefill_session, decode_session
+    timeout = aiohttp.ClientTimeout(total=100_000)
+    connector = aiohttp.TCPConnector(limit=0, force_close=False)
+    encode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    if app.state.p_urls:
+        # only setup if prefill instance(s) exist
+        prefill_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+    decode_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
 
 @app.on_event("shutdown")
-async def shutdown_event():
-    global encode_session, decode_session
+async def on_shutdown() -> None:
+    global encode_session, prefill_session, decode_session
     if encode_session:
         await encode_session.close()
+    if prefill_session:
+        await prefill_session.close()
     if decode_session:
         await decode_session.close()
 
 
-def has_mm_input(request_data: dict):
-    if "messages" not in request_data:
-        return False
-    for message in request_data["messages"]:
-        if not isinstance(message.get("content"), list):
-            continue
-        for content_item in message["content"]:
-            if content_item.get("type") in [
-                    "image_url", "audio_url", "input_audio"
-            ]:
-                return True
-    return False
+###############################################################################
+# Core forwarding
+###############################################################################
 
 
-async def forward_streaming_request(request_data: dict, request_id: str,
-                                    e_server_url: str, p_server_url: str,
-                                    d_server_url: str) -> AsyncIterator[str]:
-    max_tokens = request_data.get('max_tokens', None)
-    stream = request_data.get('stream', None)
-    stream_options = request_data.get('stream_options', None)
-
-    headers = {"x-request-id": request_id}
-    request_data['max_tokens'] = 1
-    request_data['stream'] = False
-    request_data['stream_options'] = {}
-    request_data['kv_transfer_params'] = {"do_remote_decode": True}
-
-    # Skip request to encoder instance if we don't have mm input
-    if has_mm_input(request_data):
-        task1 = asyncio.create_task(
-            encode_session.post(f"{e_server_url}/v1/chat/completions",
-                                json=request_data,
-                                headers=headers))
-        try:
-            response = await task1
-            if response.status != 200:
-                error_text = await response.text()
-                raise HTTPException(status_code=response.status,
-                                    detail={
-                                        "error": "Request failed",
-                                        "message": error_text
-                                    })
-        except Exception as e:
-            raise HTTPException(status_code=500,
-                                detail={
-                                    "error": "Internal server error",
-                                    "message": str(e)
-                                })
-
-    try:
-        resp = await response.json()
-
-        request_data['max_tokens'] = 1
-        request_data['stream'] = False
-        request_data['stream_options'] = {}
-        request_data['kv_transfer_params'] = resp['kv_transfer_params']
-        request_data['kv_transfer_params']['do_remote_decode'] = True
-
-        task2 = asyncio.create_task(
-            decode_session.post(f"{p_server_url}/v1/chat/completions",
-                                json=request_data,
-                                headers=headers))
-        try:
-            response = await task2
-            if response.status != 200:
-                error_text = await response.text()
-                raise HTTPException(status_code=response.status,
-                                    detail={
-                                        "error": "Request failed",
-                                        "message": error_text
-                                    })
-        except Exception as e:
-            raise HTTPException(status_code=500,
-                                detail={
-                                    "error": "Internal server error",
-                                    "message": str(e)
-                                })
-
-        resp = await response.json()
-
-        request_data['stream'] = stream
-        request_data['stream_options'] = stream_options
-        request_data['max_tokens'] = max_tokens
-        request_data['kv_transfer_params'] = resp['kv_transfer_params']
-
-        async with decode_session.post(f"{d_server_url}/v1/chat/completions",
-                                       json=request_data,
-                                       headers=headers) as response:
-            response.raise_for_status()
-            async for chunk in response.content.iter_chunked(128):
-                if chunk:
-                    yield chunk.decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.error(f"Error in streaming: {e}")
-        raise
-
-
-async def forward_non_streaming_request(
-    request_data: dict,
-    request_id: str,
-    e_server_url: str,
-    p_server_url: str,
-    d_server_url: str,
+async def forward_non_stream(
+    req_data: dict, req_id: str, e_url: str, p_url: str, d_url: str
 ) -> dict:
-    headers = {"x-request-id": request_id}
-    max_tokens = request_data.get('max_tokens', None)
-    stream = request_data.get('stream', None)
-    stream_options = request_data.get('stream_options', None)
+    # Step 1: Process through Encoder instance (if has MM input)
+    kv_params = await fanout_encoder_primer(req_data, e_url, req_id)
+        
+    # Step 2: Process through Prefill instance
+    req_data = await maybe_prefill(req_data, kv_params, p_url, req_id)
 
-    headers = {"x-request-id": request_id}
-    request_data['max_tokens'] = 1
-    request_data['stream'] = False
-    request_data['stream_options'] = {}
-    request_data['kv_transfer_params'] = {"do_remote_decode": True}
+    # Step 3: Process through Decode instance
+    logger.debug(f"Getting response from decode for req_id: {req_id}/ url: {d_url}")   
+    headers = {"x-request-id": req_id}
+    
+    # Non-streaming response
+    async with decode_session.post(
+        f"{d_url}/v1/chat/completions", json=req_data, headers=headers
+    ) as resp:
+        resp.raise_for_status()
+        return await resp.json()
 
-    # Skip request to encoder instance if we don't have mm input
-    if has_mm_input(request_data):
-        # Start request to encode server
-        task1 = asyncio.create_task(
-            encode_session.post(f"{e_server_url}/v1/chat/completions",
-                                json=request_data,
-                                headers=headers))
 
-        try:
-            response = await task1
-            if response.status != 200:
-                error_text = await response.text()
-                raise HTTPException(status_code=response.status,
-                                    detail={
-                                        "error": "Request failed",
-                                        "message": error_text
-                                    })
-        except Exception as e:
-            raise HTTPException(status_code=500,
-                                detail={
-                                    "error": "Internal server error",
-                                    "message": str(e)
-                                })
+async def forward_stream(
+    req_data: dict, req_id: str, e_url: str, p_url: str, d_url: str
+) -> AsyncIterator[str]:
+    # Step 1: Process through Encoder instance (if has MM input)
+    kv_params = await fanout_encoder_primer(req_data, e_url, req_id)
+        
+    # Step 2: Process through Prefill instance
+    req_data = await maybe_prefill(req_data, kv_params, p_url, req_id)
 
-    try:
-        # Make request to decode server
-        resp = await response.json()
-        request_data['max_tokens'] = 1
-        request_data['stream'] = False
-        request_data['stream_options'] = {}
-        request_data['kv_transfer_params'] = resp['kv_transfer_params']
-        request_data['kv_transfer_params']['do_remote_decode'] = True
+    # Step 3: Process through Decode instance
+    logger.debug(f"Streaming response from decode for req_id: {req_id}/ url: {d_url}")
+    headers = {"x-request-id": req_id}
 
-        task2 = asyncio.create_task(
-            decode_session.post(f"{p_server_url}/v1/chat/completions",
-                                json=request_data,
-                                headers=headers))
+    # Streaming response
+    async with decode_session.post(
+        f"{d_url}/v1/chat/completions",
+        json=req_data,
+        headers=headers,
+    ) as resp:
+        resp.raise_for_status()
+        async for chunk in resp.content.iter_chunked(1024):
+            if chunk:
+                yield chunk.decode("utf-8", errors="ignore")
 
-        try:
-            response2 = await task2
-            if response2.status != 200:
-                error_text = await response2.text()
-                raise HTTPException(status_code=response2.status,
-                                    detail={
-                                        "error": "Request failed",
-                                        "message": error_text
-                                    })
-        except Exception as e:
-            raise HTTPException(status_code=500,
-                                detail={
-                                    "error": "Internal server error",
-                                    "message": str(e)
-                                })
-
-        resp = await response2.json()
-        request_data['stream'] = stream
-        request_data['stream_options'] = stream_options
-        request_data['max_tokens'] = max_tokens
-        request_data['kv_transfer_params'] = resp['kv_transfer_params']
-        async with decode_session.post(f"{d_server_url}/v1/chat/completions",
-                                       json=request_data,
-                                       headers=headers) as response2:
-            response2.raise_for_status()
-            result = await response2.json()
-        return result
-    except Exception as e:
-        logger.error(f"Error in non-streaming: {e}")
-        raise
+###############################################################################
+# Public routes
+###############################################################################
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """Handle chat completion requests."""
-    try:
-        e_instance = random.randint(0, len(app.state.e_urls) - 1)
-        p_instance = random.randint(0, len(app.state.p_urls) - 1)
-        d_instance = random.randint(0, len(app.state.d_urls) - 1)
-        e_rank = app.state.e_ranks[e_instance]
-        p_rank = app.state.p_ranks[p_instance]
-        d_rank = app.state.d_ranks[d_instance]
-        e_server_url = app.state.e_urls[e_instance]
-        p_server_url = app.state.p_urls[p_instance]
-        d_server_url = app.state.d_urls[d_instance]
+    req_data = await request.json()
+    req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
-        logger.info(f"Matched: E-{e_rank}, P-{p_rank} D-{d_rank}")
-
-        request_data = await request.json()
-        request_id = request.headers.get("x-request-id")
-
-        if not request_id:
-            request_id = str(uuid.uuid4())
-        request_id = f"{request_id}|{e_rank}|{p_rank}|{d_rank}"
-        is_streaming = request_data.get("stream", False)
-        if is_streaming:
-            return StreamingResponse(forward_streaming_request(
-                request_data, request_id, e_server_url, p_server_url,
-                d_server_url),
-                                     media_type="text/event-stream")
-        else:
-            result = await forward_non_streaming_request(
-                request_data, request_id, e_server_url, p_server_url,
-                d_server_url)
-            return JSONResponse(content=result)
-    except Exception as e:
-        logger.error(f"Error processing request: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # e_urls = app.state.e_urls  # we want the full list for fan-out
+    e_url = random.choice(app.state.e_urls) if app.state.e_urls else None
+    p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
+    d_url = random.choice(app.state.d_urls)
+    
+    is_streaming = req_data.get("stream", False)
+    
+    if is_streaming:
+        return StreamingResponse(
+            forward_stream(req_data, req_id, e_url, p_url, d_url),
+            media_type="text/event-stream",
+        )
+    result = await forward_non_stream(req_data, req_id, e_url, p_url, d_url)
+    return JSONResponse(content=result)
 
 
 @app.get("/v1/models")
 async def list_models():
-    try:
-        async with decode_session.get(
-                f"{app.state.pd_urls[0]}/v1/models") as response:
-            response.raise_for_status()
-            return await response.json()
-    except Exception as e:
-        logger.error(f"Error fetching models: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    async with decode_session.get(f"{app.state.d_urls[0]}/v1/models") as resp:
+        resp.raise_for_status()
+        return await resp.json()
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    async def healthy(urls):
+        if not urls:
+            return "empty"
+        for u in urls:
+            try:
+                async with encode_session.get(f"{u}/health") as resp:
+                    resp.raise_for_status()
+            except Exception:
+                return "unhealthy"
+        return "healthy"
+
+    e_status, p_status, d_status = await asyncio.gather(
+        healthy(app.state.e_urls), healthy(app.state.p_urls), healthy(app.state.d_urls)
+    )
+
+    overall_healthy = all(status != "unhealthy" for status in (e_status, p_status, d_status))
+
+    status_code = 200 if overall_healthy else 503
+
+    return JSONResponse(
+        {
+            "proxy": "healthy",
+            "encode_cluster": e_status,
+            "prefill_cluster": p_status,
+            "decode_cluster": d_status,
+        },
+        status_code=status_code,
+    )
+
+
+###############################################################################
+# Simple profiler fan-out (unchanged except for sessions)
+###############################################################################
+
+
+async def _post_if_available(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: dict,
+    headers: dict,
+) -> Optional[dict]:
+    """
+    POST `payload` to `url`.
+
+    Returns
+    -------
+    • The decoded JSON body on success (2xx)  
+    • None if the endpoint does not exist (404)  
+    • Raises for anything else.
+    """
     try:
+        resp = await session.post(url, json=payload, headers=headers)
+        if resp.status == 404:           # profiling disabled on that server
+            logger.warning("Profiling endpoint missing on %s", url)
+            return None
+        resp.raise_for_status()
+        return await resp.json(content_type=None)
+    except aiohttp.ClientResponseError as exc:
+        # Pass 404 through the branch above, re-raise everything else
+        if exc.status == 404:
+            logger.warning("Profiling endpoint missing on %s", url)
+            return None
+        raise
+    except Exception:
+        # Network errors etc.: propagate
+        raise
 
-        async def check_encode():
-            try:
-                for e_url in app.state.e_urls:
-                    async with encode_session.get(
-                            f"{e_url}/health") as response:
-                        response.raise_for_status()
-                return True
-            except Exception:
-                return False
 
-        async def check_decode():
-            try:
-                for pd_url in app.state.pd_urls:
-                    async with encode_session.get(
-                            f"{pd_url}/health") as response:
-                        response.raise_for_status()
-                return True
-            except Exception:
-                return False
+async def send_profile_cmd(request: Request, req_data, profiler_cmd):
+    assert profiler_cmd in ["start", "stop"]
+    headers = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    # Send to all prefiller and decoder, leaving iterator in same state.
+    tasks = []
+    
+    for e_url in app.state.e_urls:
+        tasks.append(encode_session.post(
+            f"{e_url}/{profiler_cmd}_profile",
+            json=req_data,
+            headers=headers
+        ))
 
-        encode_healthy, decode_healthy = await asyncio.gather(
-            check_encode(), check_decode(), return_exceptions=True)
+    for p_url in app.state.p_urls:
+        tasks.append(prefill_session.post(
+            f"{p_url}/{profiler_cmd}_profile",
+            json=req_data,
+            headers=headers
+        ))
 
-        health_status = {
-            "proxy":
-            "healthy",
-            "encode_servers":
-            "healthy" if encode_healthy is True else "unhealthy",
-            "prefill_decode_servers":
-            "healthy" if decode_healthy is True else "unhealthy"
-        }
+    for d_url in app.state.d_urls:
+        tasks.append(decode_session.post(
+            f"{d_url}/{profiler_cmd}_profile",
+            json=req_data,
+            headers=headers
+        ))
 
-        if not (encode_healthy is True and decode_healthy is True):
-            return JSONResponse(content=health_status, status_code=503)
+    responses = await asyncio.gather(*tasks)
+    for r in responses:
+        r.raise_for_status()
 
-        return health_status
+    return responses[0].json()
+
+
+@app.post("/start_profile")
+async def start_profile(request: Request):
+    try:
+        req_data = await request.json()
+        return await send_profile_cmd(request, req_data, "start")
 
     except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return JSONResponse(content={
-            "proxy": "unhealthy",
-            "error": str(e)
-        },
-                            status_code=503)
+        import sys
+        import traceback
+        exc_info = sys.exc_info()
+        print("Error occurred in disagg prefill proxy server"
+              " - start_profile endpoint")
+        print(e)
+        print("".join(traceback.format_exception(*exc_info)))
 
+
+@app.post("/stop_profile")
+async def stop_profile(request: Request):
+    try:
+        req_data = await request.json()
+        return await send_profile_cmd(request, req_data, "stop")
+
+    except Exception as e:
+        import sys
+        import traceback
+        exc_info = sys.exc_info()
+        print("Error occurred in disagg prefill proxy server"
+              " - stop_profile endpoint")
+        print(e)
+        print("".join(traceback.format_exception(*exc_info)))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="API Proxy for distributed vLLM servers")
-    parser.add_argument("--host",
-                        type=str,
-                        default="localhost",
-                        help="Proxy host")
-    parser.add_argument("--port", type=int, default=8000, help="Proxy port")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--encode-servers-urls",
-        type=str,
-        default="http://localhost:8100",
-        help="URLs of the encode server in comma separated format"
-        "(e.g., \"http://localhost:8001,http://localhost:8002\")")
-
-    parser.add_argument(
-        "--encode-servers-ranks",
-        type=str,
-        default="0",
-        help="Respective EPD ranks for encode servers in comma-separated format"
-        "(e.g., \"0,1\")")
-
+        required=True,
+        help='Comma-separated encode URLs ("http://e1:8001,http://e2:8001")',
+    )
     parser.add_argument(
         "--prefill-servers-urls",
-        type=str,
-        default="http://localhost:8200",
-        help="URLs of the prefill servers in comma separated format"
-        "(e.g., \"http://localhost:8003,http://localhost:8004\")")
-
-    parser.add_argument(
-        "--prefill-servers-ranks",
-        type=str,
-        default="1",
-        help="Respective EPD ranks for prefill servers in comma-separated format"
-        "(e.g., \"2,3\")")
-
+        required=True,
+        help='Comma-separated prefill URLs ("http://p1:8003,http://p2:8004") to enable E->P->D, set "disable" or "none" to enable E->PD',
+    )
     parser.add_argument(
         "--decode-servers-urls",
-        type=str,
-        default="http://localhost:8300",
-        help="URLs of the decode servers in comma separated format"
-        "(e.g., \"http://localhost:8003,http://localhost:8004\")")
-
-    parser.add_argument(
-        "--decode-servers-ranks",
-        type=str,
-        default="2",
-        help="Respective EPD ranks for decode servers in comma-separated format"
+        required=True,
+        help='Comma-separated decode URLs ("http://d1:8005,http://d2:8006")',
     )
-
+   
     args = parser.parse_args()
-    app.state.e_urls = args.encode_servers_urls.split(",")
-    app.state.p_urls = args.prefill_servers_urls.split(",")
-    app.state.d_urls = args.decode_servers_urls.split(",")
-    app.state.e_ranks = args.encode_servers_ranks.split(",")
-    app.state.p_ranks = args.prefill_servers_ranks.split(",")
-    app.state.d_ranks = args.decode_servers_ranks.split(",")
+    app.state.e_urls = [u.strip() for u in args.encode_servers_urls.split(",") if u.strip()]
+    app.state.d_urls = [u.strip() for u in args.decode_servers_urls.split(",") if u.strip()]
+    # handle prefill instances
+    if args.prefill_servers_urls.lower() in ("disable", "none", ""):
+        app.state.p_urls = []
+        logger.info("Disaggregated prefill phase explicitly disabled by user. Running E + PD...")
+    else:
+        app.state.p_urls = [u.strip() for u in args.prefill_servers_urls.split(",") if u.strip()]
+        logger.info("Disaggregated prefill phase is enabled. Running E + P + D...")
 
-    logger.info(f"Starting API proxy on {args.host}:{args.port} with 1 worker")
-    logger.info(
-        f"Encode servers: {app.state.e_urls} (respective ranks {app.state.e_ranks})"
-    )
-    logger.info(
-        f"Prefill server: {app.state.p_urls} (respective ranks {app.state.p_ranks})"
-    )
-    logger.info(
-        f"Decode server: {app.state.d_urls} (respective ranks {app.state.d_ranks})"
-    )
+    logger.info("Proxy listening on %s:%s", args.host, args.port)
+    logger.info("Encode servers: %s", app.state.e_urls)
+    logger.info("Prefill instances %s", app.state.p_urls)
+    logger.info("Decode servers: %s", app.state.d_urls)
 
-    uvicorn.run(app,
-                host=args.host,
-                port=args.port,
-                log_level="info",
-                access_log=False,
-                loop="uvloop")
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+        loop="uvloop",
+        access_log=False,
+    )
