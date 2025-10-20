@@ -79,7 +79,8 @@ class MultiModalBudget:
         return modality
 
     def get_encoder_budget(self) -> int:
-        return min(self.encoder_compute_budget, self.encoder_cache_size)
+        return self.encoder_cache_size
+        # return min(self.encoder_compute_budget, self.encoder_cache_size)
 
     def get_max_items(
         self,

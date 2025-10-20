@@ -35,9 +35,7 @@ import asyncio
 import json
 import logging
 import os
-import random
 import uuid
-import copy
 from typing import Any, AsyncIterator, List, Optional
 import aiohttp
 import uvicorn
@@ -55,6 +53,11 @@ app = FastAPI()
 encode_session: Optional[aiohttp.ClientSession] = None
 prefill_session: Optional[aiohttp.ClientSession] = None
 decode_session: Optional[aiohttp.ClientSession] = None
+
+# Round-robin counters for server selection
+e_url_index = 0
+p_url_index = 0
+d_url_index = 0
 
 ###############################################################################
 # Utils
@@ -94,7 +97,7 @@ async def fanout_encoder_primer(
     3. Raise if any of them fails.
     """
     mm_items = extract_mm_items(orig_request)
-    if not mm_items:
+    if not mm_items or e_url is None:
         return {
             'do_remote_encode': False,
             'do_remote_prefill': False,
@@ -163,8 +166,12 @@ async def maybe_prefill(
         prefill_response_json = await prefill_response.json()
         kv_transfer_params = prefill_response_json.get('kv_transfer_params', {})
         if kv_transfer_params:
+            logger.info("kv_transfer_params: %s", kv_transfer_params)
+            # NOTE: monkey patching - ignore mm-segments
+            kv_transfer_params["do_remote_encode"] = False
+            kv_transfer_params["remote_mm_segments"] = None
+
             req_data["kv_transfer_params"] = kv_transfer_params
-            logger.debug("kv_transfer_params: %s", kv_transfer_params)
 
         return req_data
     else:
@@ -293,7 +300,7 @@ async def forward_stream(
     req_data = await maybe_prefill(req_data, kv_params, p_url, req_id)
 
     # Step 3: Process through Decode instance
-    logger.debug(f"Streaming response from decode for req_id: {req_id}/ url: {d_url}")
+    logger.info(f"Streaming response from decode for req_id: {req_id}/ e_url: {e_url}, d_url: {d_url}")
     headers = {"x-request-id": req_id}
 
     # Streaming response
@@ -314,13 +321,34 @@ async def forward_stream(
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    global e_url_index, p_url_index, d_url_index
+
     req_data = await request.json()
     req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
-    # e_urls = app.state.e_urls  # we want the full list for fan-out
-    e_url = random.choice(app.state.e_urls) if app.state.e_urls else None
-    p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
-    d_url = random.choice(app.state.d_urls)
+    img_len = 0
+    for ctn in req_data['messages'][0]['content']:
+        if ctn['type'] == 'image_url':
+            img_len = len(ctn['image_url']['url'])
+    
+    logger.warning(f"Image length: {img_len}")
+
+
+    # Round-robin server selection
+    if app.state.e_urls:
+        e_url = app.state.e_urls[e_url_index % len(app.state.e_urls)]
+        e_url_index += 1
+    else:
+        e_url = None
+
+    if app.state.p_urls:
+        p_url = app.state.p_urls[p_url_index % len(app.state.p_urls)]
+        p_url_index += 1
+    else:
+        p_url = None
+
+    d_url = app.state.d_urls[d_url_index % len(app.state.d_urls)]
+    d_url_index += 1
     
     is_streaming = req_data.get("stream", False)
     
@@ -375,39 +403,6 @@ async def health_check():
 ###############################################################################
 # Simple profiler fan-out (unchanged except for sessions)
 ###############################################################################
-
-
-async def _post_if_available(
-    session: aiohttp.ClientSession,
-    url: str,
-    payload: dict,
-    headers: dict,
-) -> Optional[dict]:
-    """
-    POST `payload` to `url`.
-
-    Returns
-    -------
-    • The decoded JSON body on success (2xx)  
-    • None if the endpoint does not exist (404)  
-    • Raises for anything else.
-    """
-    try:
-        resp = await session.post(url, json=payload, headers=headers)
-        if resp.status == 404:           # profiling disabled on that server
-            logger.warning("Profiling endpoint missing on %s", url)
-            return None
-        resp.raise_for_status()
-        return await resp.json(content_type=None)
-    except aiohttp.ClientResponseError as exc:
-        # Pass 404 through the branch above, re-raise everything else
-        if exc.status == 404:
-            logger.warning("Profiling endpoint missing on %s", url)
-            return None
-        raise
-    except Exception:
-        # Network errors etc.: propagate
-        raise
 
 
 async def send_profile_cmd(request: Request, req_data, profiler_cmd):
@@ -498,15 +493,24 @@ if __name__ == "__main__":
     )
    
     args = parser.parse_args()
-    app.state.e_urls = [u.strip() for u in args.encode_servers_urls.split(",") if u.strip()]
     app.state.d_urls = [u.strip() for u in args.decode_servers_urls.split(",") if u.strip()]
+    
+    no_encode = False
     # handle prefill instances
+    if args.encode_servers_urls.lower() in ("disable", "none", ""):
+        app.state.e_urls = []
+        no_encode = True
+    else:
+        app.state.e_urls = [u.strip() for u in args.encode_servers_urls.split(",") if u.strip()]
+
     if args.prefill_servers_urls.lower() in ("disable", "none", ""):
         app.state.p_urls = []
-        logger.info("Disaggregated prefill phase explicitly disabled by user. Running E + PD...")
+        phase = "E + PD" if not no_encode else "without disaggeregation"
+        logger.info(f"Disaggregated prefill phase explicitly disabled by user. Running {phase}...")
     else:
         app.state.p_urls = [u.strip() for u in args.prefill_servers_urls.split(",") if u.strip()]
-        logger.info("Disaggregated prefill phase is enabled. Running E + P + D...")
+        phase = "E + P + D" if not no_encode else "EP + D"
+        logger.info(f"Disaggregated prefill phase is enabled. Running {phase}...")
 
     logger.info("Proxy listening on %s:%s", args.host, args.port)
     logger.info("Encode servers: %s", app.state.e_urls)

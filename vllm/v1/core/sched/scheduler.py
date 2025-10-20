@@ -82,7 +82,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
         self.connector = None
         if self.vllm_config.kv_transfer_config is not None:
-            assert len(self.kv_cache_config.kv_cache_groups) == 1, (
+            assert len(self.kv_cache_config.kv_cache_groups) <= 1, (
                 "Multiple KV cache groups are not currently supported "
                 "with KV connectors")
             assert not self.is_encoder_decoder, (
@@ -860,6 +860,8 @@ class Scheduler(SchedulerInterface):
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
 
+            # logger.warning(f"new encoder budget: {encoder_compute_budget}/{self.max_num_encoder_input_tokens}")
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
@@ -898,6 +900,8 @@ class Scheduler(SchedulerInterface):
                 mm_hash = self.requests[req_id].mm_hashes[input_id]
                 scheduled_encoder_segments[
                     mm_hash] = self.encoder_cache_manager.get_segments(mm_hash)
+
+        # logger.warning(f"batched image count: {sum(len(v) for v in scheduled_encoder_inputs.values())}")
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1564,7 +1568,11 @@ class Scheduler(SchedulerInterface):
         if self.connector is None:
             return False, None
 
-        (block_ids, ) = self.kv_cache_manager.get_block_ids(request.request_id)
+        ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        if len(ids) == 0:
+            block_ids = []
+        else:
+            block_ids = ids[0]
         mm_segments = dict()
         for mm_hash in request.mm_hashes:
             mm_segments[mm_hash] = [

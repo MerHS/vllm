@@ -94,7 +94,7 @@ class SchedulerConfig:
     """True if the model is multimodal."""
 
     # TODO (ywang96): Make this configurable.
-    max_num_encoder_input_tokens: int = field(init=False)
+    max_num_encoder_input_tokens: SkipValidation[int] = None  # type: ignore
     """Multimodal encoder compute budget, only used in V1.
 
     NOTE: This is not currently configurable. It will be overridden by
@@ -215,7 +215,7 @@ class SchedulerConfig:
                 self.max_num_seqs * self.max_model_len,
                 self.max_num_batched_tokens)
 
-        self.max_num_encoder_input_tokens = self.max_num_batched_tokens
+        # self.max_num_encoder_input_tokens = self.max_num_batched_tokens
         self.encoder_cache_size = self.max_num_batched_tokens
 
         if self.enable_chunked_prefill:

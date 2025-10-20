@@ -543,8 +543,18 @@ def compute_mm_encoder_budget(
             f" ({scheduler_config.max_num_batched_tokens}). Please increase "
             "max_num_batched_tokens.")
 
-    encoder_compute_budget = max(scheduler_config.max_num_encoder_input_tokens,
-                                 max_tokens_per_mm_item)
+    # encoder_compute_budget = max(scheduler_config.max_num_encoder_input_tokens,
+    #                              max_tokens_per_mm_item)
+    if scheduler_config.max_num_encoder_input_tokens is None:
+        encoder_compute_budget = max(
+            scheduler_config.encoder_cache_size,
+            max_tokens_per_mm_item
+        )
+        logger.warning(f"encoder_compute_budget: {encoder_compute_budget}")
+    else:
+        encoder_compute_budget = scheduler_config.max_num_encoder_input_tokens
+        logger.warning(f"encoder_compute_budget - manual: {encoder_compute_budget}")
+
     encoder_cache_size = max(scheduler_config.encoder_cache_size,
                              max_tokens_per_mm_item)
 

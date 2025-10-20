@@ -304,6 +304,8 @@ class EngineArgs:
     max_model_len: Optional[int] = ModelConfig.max_model_len
     cuda_graph_sizes: list[int] = get_field(SchedulerConfig,
                                             "cuda_graph_sizes")
+    max_num_encoder_input_tokens: int = get_field(SchedulerConfig,
+                                                  "max_num_encoder_input_tokens")
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -861,6 +863,8 @@ class EngineArgs:
             **scheduler_kwargs["max_long_partial_prefills"])
         scheduler_group.add_argument('--cuda-graph-sizes',
                                      **scheduler_kwargs["cuda_graph_sizes"])
+        scheduler_group.add_argument('--max-num-encoder-input-tokens',
+                                     **scheduler_kwargs["max_num_encoder_input_tokens"])
         scheduler_group.add_argument(
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"])
@@ -1363,6 +1367,7 @@ class EngineArgs:
                              and parallel_config.use_ray),
             policy=self.scheduling_policy,
             scheduler_cls=self.scheduler_cls,
+            max_num_encoder_input_tokens=self.max_num_encoder_input_tokens,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,

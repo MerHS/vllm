@@ -7,6 +7,7 @@ from typing import AsyncIterator, Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 import aiohttp
 from fastapi.responses import StreamingResponse, JSONResponse
+import traceback
 import uvicorn
 import argparse
 import logging
@@ -55,6 +56,9 @@ def has_mm_input(request_data: dict):
     return False
 
 
+req_list = []
+
+
 async def forward_streaming_request(
     request_data: dict,
     request_id: str,
@@ -70,6 +74,8 @@ async def forward_streaming_request(
     request_data['stream'] = False
     request_data['stream_options'] = {}
     request_data['kv_transfer_params'] = {"do_remote_decode": True}
+
+    start_time = time.perf_counter()
 
     # Skip request to encoder instance if we don't have mm input
     if has_mm_input(request_data):
@@ -99,6 +105,15 @@ async def forward_streaming_request(
         request_data['stream_options'] = stream_options
         request_data['max_tokens'] = max_tokens
         request_data['kv_transfer_params'] = resp['kv_transfer_params']
+
+        end_time = time.perf_counter()
+        if request_id.startswith('benchmark-serving'):
+            req_list.append(end_time - start_time)
+        if len(req_list) == 299:
+            req_list.sort()
+            print(
+                f"Encode time mean: {sum(req_list)/len(req_list)}, median: {req_list[len(req_list)//2]}, p90: {req_list[int(len(req_list)*0.9)]}, p95: {req_list[int(len(req_list)*0.95)]}, p99: {req_list[int(len(req_list)*0.99)]}"
+            )
 
         async with decode_session.post(f"{pd_server_url}/v1/chat/completions",
                                        json=request_data,
@@ -171,9 +186,14 @@ async def forward_non_streaming_request(
         raise
 
 
+REQ_NO = 1
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """Handle chat completion requests."""
+    global REQ_NO
+
     try:
         e_instance = random.randint(0, len(app.state.e_urls) - 1)
         pd_instance = random.randint(0, len(app.state.pd_urls) - 1)
@@ -188,7 +208,10 @@ async def chat_completions(request: Request):
         request_id = request.headers.get("x-request-id")
 
         if not request_id:
-            request_id = str(uuid.uuid4())
+            REQ_NO += 1
+            request_id = f"req-{REQ_NO}"
+            # request_id = str(uuid.uuid4())
+
         request_id = f"{request_id}|{e_rank}|{pd_rank}"
         is_streaming = request_data.get("stream", False)
         if is_streaming:
@@ -200,6 +223,7 @@ async def chat_completions(request: Request):
                 request_data, request_id, e_server_url, pd_server_url)
             return JSONResponse(content=result)
     except Exception as e:
+        traceback.print_exc()
         logger.error(f"Error processing request: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 

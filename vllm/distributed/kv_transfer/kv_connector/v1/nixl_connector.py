@@ -522,7 +522,7 @@ class NixlConnectorScheduler:
 
         return delay_free_blocks, dict(
             do_remote_prefill=do_remote_prefill,
-            do_remote_decode=False,
+            do_remote_decode=False, # do_remote_decode is set from the router
             do_remote_encode=do_remote_encode,
             remote_block_ids=block_ids,
             remote_mm_segments=mm_segments,

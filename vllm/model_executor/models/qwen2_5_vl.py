@@ -920,6 +920,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self.vllm_config = vllm_config
         config: Qwen2_5_VLConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
@@ -940,14 +941,19 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         else:
             self.visual = None
 
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-            architectures=["Qwen2ForCausalLM"],
-        )
+        if self.vllm_config.kv_transfer_config is not None and \
+            self.vllm_config.kv_transfer_config.is_encoder_only:
+            self.language_model = None
+            self.make_empty_intermediate_tensors = None
+        else:
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["Qwen2ForCausalLM"],
+            )
 
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors)
+            self.make_empty_intermediate_tensors = (
+                self.language_model.make_empty_intermediate_tensors)
 
     def _maybe_ignore_quant_config(self, config: Optional[QuantizationConfig]):
         # GPTQ configs do not have a list of ignored modules, however AutoGPTQ
@@ -1238,8 +1244,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-
         skip_prefixes = []
+        if self.vllm_config.kv_transfer_config is not None and \
+            self.vllm_config.kv_transfer_config.is_encoder_only:
+            skip_prefixes.append("language_model.")
+
         if self.visual is None:
             skip_prefixes.extend(["visual."])
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
