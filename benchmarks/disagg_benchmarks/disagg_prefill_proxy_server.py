@@ -54,13 +54,13 @@ def parse_args():
     parser.add_argument(
         "--prefill-url",
         type=str,
-        default="http://localhost:8100/v1/completions",
+        default="http://localhost:8100/v1/chat/completions",
         help="Prefill service endpoint URL",
     )
     parser.add_argument(
         "--decode-url",
         type=str,
-        default="http://localhost:8200/v1/completions",
+        default="http://localhost:8200/v1/chat/completions",
         help="Decode service endpoint URL",
     )
 
@@ -165,7 +165,7 @@ def main():
                 content_type="application/json",
             )
 
-    @app.route("/v1/completions", methods=["POST"])
+    @app.route("/v1/chat/completions", methods=["POST"])
     async def handle_request():
         """Handle incoming API requests with concurrency and rate limiting"""
         # Create task for request processing
