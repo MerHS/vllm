@@ -409,7 +409,7 @@ class Scheduler(SchedulerInterface):
 
                 # required_encoder_inputs: not cached
                 # receiving_encoder_inputs: cached but waiting for receiving remote values
-                required_encoder_inputs, receving_mm_hashes = self.encoder_cache_manager.get_required_encoder_inputs(
+                required_encoder_inputs, receiving_mm_hashes = self.encoder_cache_manager.get_required_encoder_inputs(
                     request)
 
                 if self.connector is not None:
@@ -418,7 +418,7 @@ class Scheduler(SchedulerInterface):
                         request,
                         required_encoder_inputs,
                     )
-                    load_mm_async = remote_encoder_inputs or receving_mm_hashes
+                    load_mm_async = bool(remote_encoder_inputs or len(receiving_mm_hashes) > 0)
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
@@ -1113,6 +1113,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = start_pos - num_computed_tokens
                 break
 
+            # FIXED: allocate until encoder_compute_budget become negative.
             if not self.encoder_cache_manager.can_allocate(
                     request, i, encoder_compute_budget,
                     num_tokens_to_schedule):
@@ -1573,12 +1574,12 @@ class Scheduler(SchedulerInterface):
             block_ids = []
         else:
             block_ids = ids[0]
-        mm_segments = dict()
+        mm_segments = []
         for mm_hash in request.mm_hashes:
-            mm_segments[mm_hash] = [
+            mm_segments.append((mm_hash, [
                 (s.address, s.size)
                 for s in self.encoder_cache_manager.get_segments(mm_hash)
-            ]
+            ]))
         return self.connector.request_finished(request, block_ids, mm_segments)
 
     def _update_waiting_for_remote_kv(self, request: Request) -> bool:

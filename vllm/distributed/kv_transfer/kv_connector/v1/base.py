@@ -62,6 +62,9 @@ CopyBlocksOp = Callable[[
 
 logger = init_logger(__name__)
 
+# list of (mm_hash, list of (token offset, length))
+# do not use dict for index-matching
+MMSegments = list[tuple[str, list[tuple[int, int]]]]
 
 class KVConnectorRole(enum.Enum):
     # Connector running in the scheduler process
@@ -358,7 +361,7 @@ class KVConnectorBase_V1(ABC):
 
     def request_finished(
         self, request: "Request", block_ids: list[int],
-        mm_segments: dict[str, list[tuple[int, int]]]
+        mm_segments: MMSegments
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         """
         Called when a request has finished, before its blocks are freed.

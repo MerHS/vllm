@@ -32,6 +32,7 @@ from openai.types.responses import ResponseInputImageParam
 from openai_harmony import Message as OpenAIHarmonyMessage
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, TypeAdapter
+import torch
 # yapf: enable
 from transformers import (PreTrainedTokenizer, PreTrainedTokenizerFast,
                           ProcessorMixin)
@@ -50,7 +51,7 @@ from vllm.transformers_utils.chat_templates import (
 # yapf: enable
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.utils import random_uuid
+from vllm.utils import random_uuid, STR_DTYPE_TO_TORCH_DTYPE
 
 logger = init_logger(__name__)
 
@@ -94,6 +95,21 @@ class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     User-provided UUID of a media. User must guarantee that it is properly
     generated and unique for different medias.
     """
+
+class ChatCompletionContentPartImageMetaParam(TypedDict, total=False):
+    image_meta: Required[dict[str, Any]] # includes mm_hash, dtype, shape
+    """
+    The preprocessed dummy image metadata. It can be either:
+    - A dictionary where each value is a base64 string.
+    """
+    type: Required[Literal["image_meta"]]
+    """The type of the content part."""
+    uuid: Optional[str]
+    """
+    User-provided UUID of a media. User must guarantee that it is properly
+    generated and unique for different medias.
+    """
+
 
 
 class VideoURL(TypedDict, total=False):
@@ -218,6 +234,7 @@ ChatCompletionContentPartParam: TypeAlias = Union[
     CustomChatCompletionContentPILImageParam,
     CustomChatCompletionContentSimpleImageParam,
     ChatCompletionContentPartImageEmbedsParam,
+    ChatCompletionContentPartImageMetaParam,
     CustomChatCompletionContentSimpleAudioParam,
     CustomChatCompletionContentSimpleVideoParam,
     str,
@@ -580,7 +597,7 @@ def resolve_chat_template_content_format(
     return detected_format
 
 
-ModalityStr = Literal["image", "audio", "video", "image_embeds"]
+ModalityStr = Literal["image", "audio", "video", "image_embeds", "image_meta"]
 _T = TypeVar("_T")
 
 
@@ -633,7 +650,7 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
         An optional uuid can be added which serves as a unique identifier of the
         media. 
         """
-        input_modality = modality.replace("_embeds", "")
+        input_modality = modality.replace("_embeds", "").replace("_meta", "")
         num_items = len(self._items_by_modality[modality]) + 1
 
         self.mm_processor.validate_num_items(input_modality, num_items)
@@ -660,6 +677,8 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
                     "Only one message can have {'type': 'image_embeds'}"
                 )
             mm_uuids["image"] = uuids_by_modality["image_embeds"]
+        if "image_meta" in uuids_by_modality:
+            mm_uuids["image"] = uuids_by_modality["image_meta"]
         if "image" in uuids_by_modality:
             mm_uuids["image"] = uuids_by_modality["image"]  # UUIDs of images
         if "audio" in uuids_by_modality:
@@ -691,6 +710,8 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[object]):
                     "Only one message can have {'type': 'image_embeds'}"
                 )
             mm_inputs["image"] = image_embeds_lst[0]
+        if "image_meta" in items_by_modality:
+            mm_inputs["image"] = items_by_modality["image_meta"]  # A list of images
         if "image" in items_by_modality:
             mm_inputs["image"] = items_by_modality["image"]  # A list of images
         if "audio" in items_by_modality:
@@ -725,6 +746,8 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
                     "Only one message can have {'type': 'image_embeds'}"
                 )
             mm_inputs["image"] = image_embeds_lst[0]
+        if "image_meta" in items_by_modality:
+            mm_inputs["image"] = items_by_modality["image_meta"]  # A list of images
         if "image" in items_by_modality:
             mm_inputs["image"] = items_by_modality["image"]  # A list of images
         if "audio" in items_by_modality:
@@ -772,6 +795,14 @@ class BaseMultiModalContentParser(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def parse_image_meta(
+        self,
+        image_meta: dict[str, Any],
+        uuid: Optional[str] = None,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def parse_image_pil(
         self, image_pil: Image.Image, uuid: Optional[str] = None
     ) -> None:
@@ -797,6 +828,8 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         super().__init__()
 
         self._tracker = tracker
+        self._hidden_size = self._tracker._model_config.get_hidden_size()
+        self._dtype = self._tracker._model_config.dtype
 
         self._connector = MediaConnector(
             media_io_kwargs=self._tracker._model_config.media_io_kwargs,
@@ -824,6 +857,27 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         if isinstance(image_embeds, str):
             embedding = self._connector.fetch_image_embedding(image_embeds)
             placeholder = self._tracker.add("image_embeds", embedding, uuid)
+
+        self._add_placeholder("image", placeholder)
+
+    def parse_image_meta(
+        self,
+        image_meta: dict[str, Any],
+        uuid: Optional[str] = None,
+    ) -> None:
+        shape = (image_meta['token_len'], self._hidden_size)
+        image_embeds = torch.zeros(shape, dtype=self._dtype)
+        image_grid_thw = image_meta.get('image_grid_thw', None)
+
+        if image_grid_thw is not None:
+            embeds = dict(
+                image_embeds=image_embeds,
+                image_grid_thw=torch.tensor(image_grid_thw, dtype=torch.int64),
+            )
+        else:
+            embeds = image_embeds
+
+        placeholder = self._tracker.add("image_meta", embeds, image_meta['mm_hash'])
 
         self._add_placeholder("image", placeholder)
 
@@ -860,6 +914,8 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         super().__init__()
 
         self._tracker = tracker
+        self._hidden_size = self._tracker._model_config.get_hidden_size()
+        self._dtype = self._tracker._model_config.dtype
         self._connector = MediaConnector(
             media_io_kwargs=self._tracker._model_config.media_io_kwargs,
             allowed_local_media_path=tracker.allowed_local_media_path,
@@ -890,6 +946,30 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
             future.set_result(embedding)
 
         placeholder = self._tracker.add("image_embeds", future, uuid)
+        self._add_placeholder("image", placeholder)
+
+    def parse_image_meta(
+        self,
+        image_meta: dict[str, Any],
+        uuid: Optional[str] = None,
+    ) -> None:
+        future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+
+        shape = (image_meta['token_len'], self._hidden_size)
+        image_embeds = torch.zeros(shape, dtype=self._dtype)
+        image_grid_thw = image_meta.get('image_grid_thw', None)
+
+        if image_grid_thw is not None:
+            embeds = dict(
+                image_embeds=image_embeds,
+                image_grid_thw=torch.tensor(image_grid_thw, dtype=torch.int64),
+            )
+        else:
+            embeds = image_embeds
+
+        future.set_result(embeds)
+
+        placeholder = self._tracker.add("image_meta", future, image_meta["mm_hash"])
         self._add_placeholder("image", placeholder)
 
     def parse_image_pil(
@@ -1064,6 +1144,7 @@ def _get_full_multimodal_text_prompt(
 # No need to validate using Pydantic again
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
 _ImageEmbedsParser = partial(cast, ChatCompletionContentPartImageEmbedsParam)
+_ImageMetaParser = partial(cast, ChatCompletionContentPartImageMetaParam)
 _InputAudioParser = partial(cast, ChatCompletionContentPartInputAudioParam)
 _RefusalParser = partial(cast, ChatCompletionContentPartRefusalParam)
 _PILImageParser = partial(cast, CustomChatCompletionContentPILImageParam)
@@ -1094,6 +1175,9 @@ MM_PARSER_MAP: dict[
     .get("url", None),
     "image_embeds": lambda part: _ImageEmbedsParser(part).get(
         "image_embeds", None
+    ),
+    "image_meta": lambda part: _ImageMetaParser(part).get(
+        "image_meta", None
     ),
     "image_pil": lambda part: _PILImageParser(part).get("image_pil", None),
     "audio_url": lambda part: _AudioParser(part)
@@ -1178,6 +1262,7 @@ VALID_MESSAGE_CONTENT_MM_PART_TYPES = (
     "refusal",
     "image_url",
     "image_embeds",
+    "image_meta",
     "image_pil",
     "audio_url",
     "input_audio",
@@ -1276,6 +1361,10 @@ def _parse_chat_message_content_part(
     elif part_type == "image_embeds":
         content = cast(Union[str, dict[str, str]], content)
         mm_parser.parse_image_embeds(content, uuid)
+        modality = "image"
+    elif part_type == "image_meta":
+        content = cast(dict[str, Any], content)
+        mm_parser.parse_image_meta(content, uuid)
         modality = "image"
     elif part_type == "audio_url":
         str_content = cast(str, content)

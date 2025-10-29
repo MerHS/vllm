@@ -546,6 +546,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                       device=self.device)
             self.register_encoder_recv_tensor(mm_hash, recv_tensor,
                                               local_segments)
+
             self.encoder_cache[mm_hash] = recv_tensor
 
         # Remove the unscheduled requests from the persistent batch.
@@ -1408,11 +1409,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         # Batch the multi-modal inputs using the helper method.
-        mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(
+        mm_kwargs_all, mm_hashes_pos_all = self._batch_mm_kwargs_from_scheduler(
             scheduler_output)
 
-        if not mm_kwargs:
+        if not mm_kwargs_all:
             return [], []
+
+        # NOTE: raw embed values must not be attached in mm_kwargs in EPD disaggregation
+        # since they should be already in multi-modal cache.
+        # This is just for safe guard when timeout.
+        mm_kwargs = []
+        mm_hashes_pos = []
+        for mm_kwarg, (mm_hash, pos_info) in zip(mm_kwargs_all, mm_hashes_pos_all):
+            embed_key = None
+            for key in mm_kwarg.keys():
+                if key.endswith("_embeds"):
+                    embed_key = key
+                    break
+            if embed_key is not None:
+                # add embed value in cache
+                output = mm_kwarg[embed_key].data.to(device=self.device)
+                self.encoder_cache[mm_hash] = scatter_mm_placeholders(
+                    output,
+                    is_embed=pos_info.is_embed,
+                )
+                continue
+
+            mm_kwargs.append(mm_kwarg)
+            mm_hashes_pos.append((mm_hash, pos_info))
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
@@ -1445,10 +1469,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
 
+        output_views = []
         if self.encoder_memory_pool is not None:
-            output_views = []
             sched_segments = scheduler_output.scheduled_encoder_segments
-            for (mm_hash, _), output in zip(mm_hashes_pos, encoder_outputs):
+            for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
+                logger.warning("mm_hash: %s, pos_info: %s, out: %s %s", mm_hash, pos_info, output[:10], output[-10:])
+
+                output = scatter_mm_placeholders(
+                    output,
+                    is_embed=pos_info.is_embed,
+                )
+
                 if mm_hash in sched_segments:
                     segments = sched_segments[mm_hash]
                     offset = 0
@@ -1463,14 +1494,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         output = mem_slice
 
                 output_views.append(output)
-            encoder_outputs = output_views
+        else:
+            for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
+                logger.warning("mm_hash: %s, pos_info: %s, out: %s %s", mm_hash, pos_info, output[:10], output[-10:])
+                output = scatter_mm_placeholders(
+                    output,
+                    is_embed=pos_info.is_embed,
+                )
+                output_views.append(output)
 
         # Cache the encoder outputs by mm_hash
-        for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
-            self.encoder_cache[mm_hash] = scatter_mm_placeholders(
-                output,
-                is_embed=pos_info.is_embed,
-            )
+        for (mm_hash, pos_info), output in zip(mm_hashes_pos, output_views):
+            self.encoder_cache[mm_hash] = output
 
     def _gather_mm_embeddings(
         self,
@@ -1521,6 +1556,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     encoder_output[start_idx:end_idx],
                     is_embed=is_embed,
                 )
+
+                logger.warning("get_enc mm_hash: %s, pos_info: %s, out: %s %s", mm_hash, pos_info, encoder_output[:10], encoder_output[-10:])
+
                 mm_embeds.append(mm_embeds_item)
         return mm_embeds
 
@@ -3722,6 +3760,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        if self.is_mm_encoder_only_model:
+            return {}
 
         block_size = self.vllm_config.cache_config.block_size
         use_mla = self.vllm_config.model_config.use_mla

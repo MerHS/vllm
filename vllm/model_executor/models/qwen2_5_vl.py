@@ -920,7 +920,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.vllm_config = vllm_config
+        self.skip_load_llm = vllm_config.kv_transfer_config is not None and \
+            vllm_config.kv_transfer_config.is_encoder_only
+        
         config: Qwen2_5_VLConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
@@ -941,8 +943,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         else:
             self.visual = None
 
-        if self.vllm_config.kv_transfer_config is not None and \
-            self.vllm_config.kv_transfer_config.is_encoder_only:
+        if self.skip_load_llm:
             self.language_model = None
             self.make_empty_intermediate_tensors = None
         else:
@@ -1245,8 +1246,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         skip_prefixes = []
-        if self.vllm_config.kv_transfer_config is not None and \
-            self.vllm_config.kv_transfer_config.is_encoder_only:
+        if self.skip_load_llm:
             skip_prefixes.append("language_model.")
 
         if self.visual is None:

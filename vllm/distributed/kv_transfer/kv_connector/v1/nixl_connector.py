@@ -22,7 +22,7 @@ from vllm import envs
 from vllm.attention.selector import backend_name_to_enum, get_attn_backend
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    CopyBlocksOp, KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+    CopyBlocksOp, KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole, MMSegments)
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
     get_tp_group)
@@ -82,10 +82,6 @@ class NixlAgentMetadata(
     # encoder cache parts
     enc_base_addr: int
     enc_token_bytes: int
-
-
-# mm_hash -> list of (token offset, length)
-MMSegments = dict[str, list[tuple[int, int]]]
 
 
 @dataclass
@@ -338,14 +334,16 @@ class NixlConnectorScheduler:
         """
         params = request.kv_transfer_params
         remote_segments = params.get("remote_mm_segments",
-                                     None) if params else None
+                                     None) if params else None  
         if remote_segments is None:
             return None
+        
+        remote_mm_hashes = set([r[0] for r in remote_segments])
 
         available_ids = []
         for input_id in required_encoder_inputs:
             mm_hash = request.mm_hashes[input_id]
-            if mm_hash in remote_segments:
+            if mm_hash in remote_mm_hashes:
                 available_ids.append(input_id)
 
         return available_ids
@@ -415,11 +413,13 @@ class NixlConnectorScheduler:
             if params.get("remote_mm_segments"):
                 if all(p in params for p in ("remote_engine_id", "remote_host",
                                              "remote_port")):
-                    recv_segments: MMSegments = dict()
+                    recv_segments: MMSegments = []
                     remote_mm_segments = params["remote_mm_segments"]
+                    remote_mm_dict = {mm_hash: segments for (mm_hash, segments) in remote_mm_segments}
+
                     for input_id in remote_encoder_inputs:
                         mm_hash = request.mm_hashes[input_id]
-                        recv_segments[mm_hash] = remote_mm_segments[mm_hash]
+                        recv_segments.append((mm_hash, remote_mm_dict[mm_hash]))
 
                     # in-place update _reqs_need_recv
                     if request.request_id in self._reqs_need_recv:
@@ -1374,7 +1374,7 @@ class NixlConnectorWorker:
                                    remote_mm_segments=meta.remote_mm_segments)
 
     def _read_mm_segments(self, request_id: str, dst_engine_id: str,
-                          remote_mm_segments: dict[str, tuple[int, int]]):
+                          remote_mm_segments: MMSegments):
         # TODO: tp_ratio in remote encoder?
         tp_ratio = self._tp_size[
             self.engine_id] // self._tp_size[dst_engine_id]
@@ -1386,10 +1386,10 @@ class NixlConnectorWorker:
             return
 
         base_addr, token_bytes = self._remote_enc_base_addr[dst_engine_id]
-
-        for mm_hash, mm_segments in remote_mm_segments.items():
-            remote_segments = []
-            local_segments = []
+        remote_segments = []
+        local_segments = []
+        
+        for mm_hash, mm_segments in remote_mm_segments:
             idx = [i for i in range(len(mm_segments))]
             local_base_addr = self._registered_mm_descs[mm_hash][0]
 
@@ -1404,31 +1404,31 @@ class NixlConnectorWorker:
 
                 local_offset += token_len
 
-            src_descs = self.nixl_wrapper.get_xfer_descs(
-                local_segments, self.nixl_memory_type)
-            src_xfer_handle = self.nixl_wrapper.prep_xfer_dlist(
-                "NIXL_INIT_AGENT", src_descs)
+        src_descs = self.nixl_wrapper.get_xfer_descs(
+            local_segments, self.nixl_memory_type)
+        src_xfer_handle = self.nixl_wrapper.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", src_descs)
 
-            dst_descs = self.nixl_wrapper.get_xfer_descs(
-                remote_segments, self.nixl_memory_type)
-            dst_xfer_handle = self.nixl_wrapper.prep_xfer_dlist(
-                agent_name, dst_descs)
+        dst_descs = self.nixl_wrapper.get_xfer_descs(
+            remote_segments, self.nixl_memory_type)
+        dst_xfer_handle = self.nixl_wrapper.prep_xfer_dlist(
+            agent_name, dst_descs)
 
-            handle = self.nixl_wrapper.make_prepped_xfer("READ",
-                                                         src_xfer_handle,
-                                                         idx,
-                                                         dst_xfer_handle,
-                                                         idx,
-                                                         notif_msg=notif_id)
+        handle = self.nixl_wrapper.make_prepped_xfer("READ",
+                                                        src_xfer_handle,
+                                                        idx,
+                                                        dst_xfer_handle,
+                                                        idx,
+                                                        notif_msg=notif_id)
 
-            self.nixl_wrapper.transfer(handle)
+        self.nixl_wrapper.transfer(handle)
 
-            self._xfer_side_mm_handle[(request_id,
-                                       handle)] = (mm_hash, src_xfer_handle,
-                                                   dst_xfer_handle)
+        self._xfer_side_mm_handle[(request_id,
+                                    handle)] = (mm_hash, src_xfer_handle,
+                                                dst_xfer_handle)
 
-            self._recving_transfers[request_id].append(
-                (handle, time.perf_counter()))
+        self._recving_transfers[request_id].append(
+            (handle, time.perf_counter()))
 
     def _read_blocks(self, local_block_ids: list[int],
                      remote_block_ids: list[int], dst_engine_id: str,

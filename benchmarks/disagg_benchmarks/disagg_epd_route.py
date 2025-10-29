@@ -64,7 +64,7 @@ d_url_index = 0
 ###############################################################################
 
 
-MM_TYPES = {"image_url", "audio_url", "input_audio"}
+MM_TYPES = {"image_url", "audio_url", "video_url"}
 
 
 def extract_mm_items(request_data: dict) -> List[dict]:
@@ -85,6 +85,36 @@ def extract_mm_items(request_data: dict) -> List[dict]:
                 items.append(item)
     return items
 
+def replace_mm_items_to_meta(req_data: dict, kv_params: dict):
+    if req_data['model'].startswith('Qwen'):
+        # skip Qwen which returns image_grid_thw
+        return req_data
+
+    mm_segments = kv_params.get('remote_mm_segments', [])
+
+    mm_idx = 0 
+    for msg in req_data.get("messages", []):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        
+        contents = []
+        for item in content:
+            if item.get("type") in MM_TYPES:
+                mm_hash, seg_list = mm_segments[mm_idx]
+                seg_len = sum(s[1] for s in seg_list)
+                mm_idx += 1
+                item = dict(
+                    type="image_meta",
+                    image_meta=dict(
+                        mm_hash=mm_hash,
+                        token_len=seg_len
+                    )
+                )
+                
+            contents.append(item)
+            
+    return req_data
 
 async def fanout_encoder_primer(
     orig_request: dict,
@@ -98,6 +128,7 @@ async def fanout_encoder_primer(
     """
     mm_items = extract_mm_items(orig_request)
     if not mm_items or e_url is None:
+        # P-D disagg only
         return {
             'do_remote_encode': False,
             'do_remote_prefill': False,
@@ -141,7 +172,7 @@ async def fanout_encoder_primer(
     encoder_json = await result.json()
     kv_transfer_params = encoder_json.get('kv_transfer_params', {})
 
-    kv_transfer_params['do_remote_decode'] = True
+    # kv_transfer_params['do_remote_decode'] = True
     
     return kv_transfer_params
 
@@ -166,7 +197,6 @@ async def maybe_prefill(
         prefill_response_json = await prefill_response.json()
         kv_transfer_params = prefill_response_json.get('kv_transfer_params', {})
         if kv_transfer_params:
-            logger.info("kv_transfer_params: %s", kv_transfer_params)
             # NOTE: monkey patching - ignore mm-segments
             kv_transfer_params["do_remote_encode"] = False
             kv_transfer_params["remote_mm_segments"] = None
@@ -175,6 +205,7 @@ async def maybe_prefill(
 
         return req_data
     else:
+        req_data["kv_transfer_params"] = kv_params
         return req_data
 
 
@@ -268,15 +299,23 @@ async def on_shutdown() -> None:
 # Core forwarding
 ###############################################################################
 
+async def forward_ep(req_data, req_id: str, e_url: str, p_url: str):
+    if e_url or p_url:
+        # Step 1: Process through Encoder instance (if has MM input)
+        kv_params = await fanout_encoder_primer(req_data, e_url, req_id)
+
+        if 'remote_mm_segments' in kv_params:
+            req_data = replace_mm_items_to_meta(req_data, kv_params)
+            
+        # Step 2: Process through Prefill instance
+        req_data = await maybe_prefill(req_data, kv_params, p_url, req_id)
+
+    return req_data
 
 async def forward_non_stream(
     req_data: dict, req_id: str, e_url: str, p_url: str, d_url: str
 ) -> dict:
-    # Step 1: Process through Encoder instance (if has MM input)
-    kv_params = await fanout_encoder_primer(req_data, e_url, req_id)
-        
-    # Step 2: Process through Prefill instance
-    req_data = await maybe_prefill(req_data, kv_params, p_url, req_id)
+    req_data = await forward_ep(req_data, req_id, e_url, p_url)
 
     # Step 3: Process through Decode instance
     logger.debug(f"Getting response from decode for req_id: {req_id}/ url: {d_url}")   
@@ -294,11 +333,8 @@ async def forward_stream(
     req_data: dict, req_id: str, e_url: str, p_url: str, d_url: str, img_len: int
 ) -> AsyncIterator[str]:
     start_time = time.perf_counter()
-    # Step 1: Process through Encoder instance (if has MM input)
-    kv_params = await fanout_encoder_primer(req_data, e_url, req_id)
-        
-    # Step 2: Process through Prefill instance
-    req_data = await maybe_prefill(req_data, kv_params, p_url, req_id)
+    
+    req_data = await forward_ep(req_data, req_id, e_url, p_url)
 
     duration = time.perf_counter() - start_time
     # Step 3: Process through Decode instance
@@ -335,24 +371,25 @@ async def chat_completions(request: Request):
 
     # Round-robin server selection
     if app.state.e_urls:
-        if img_len < 300000:
-            e_url = app.state.e_urls[0]
-        else:
-            e_url = app.state.e_urls[1]
+        # if img_len < 300000:
+        #     e_url = app.state.e_urls[0]
+        # else:
+        #     e_url = app.state.e_urls[1]
 
-        # e_url = app.state.e_urls[e_url_index % len(app.state.e_urls)]
-        # e_url_index += 1
+        e_url = app.state.e_urls[e_url_index]
+        e_url_index = (e_url_index + 1) % len(app.state.e_urls)
     else:
         e_url = None
 
     if app.state.p_urls:
-        p_url = app.state.p_urls[p_url_index % len(app.state.p_urls)]
-        p_url_index += 1
+        p_url = app.state.p_urls[p_url_index]
+        p_url_index = (p_url_index + 1) % len(app.state.p_urls)
+
     else:
         p_url = None
 
-    d_url = app.state.d_urls[d_url_index % len(app.state.d_urls)]
-    d_url_index += 1
+    d_url = app.state.d_urls[d_url_index]
+    d_url_index = (d_url_index + 1) % len(app.state.d_urls)
     
     is_streaming = req_data.get("stream", False)
     

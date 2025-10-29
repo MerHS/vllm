@@ -1047,6 +1047,9 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
+        self.skip_load_llm = vllm_config.kv_transfer_config is not None and \
+            vllm_config.kv_transfer_config.is_encoder_only
+
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -1410,6 +1413,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             "loc_encoder", "loc_decoder", "sam", "temporal_token",
             "track_token"
         ]
+
+        if self.skip_load_llm:
+            skip_prefixes.append("language_model.")
+
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
 
