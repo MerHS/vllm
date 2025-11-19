@@ -238,8 +238,6 @@ class EncoderCacheManager:
             num_tokens = request.get_num_encoder_tokens(input_id)
             self.freeable[mm_hash] = num_tokens
             self.num_freeable_slots += num_tokens
-        
-        logger.warning("free mm_hash: %s, req_id: %s", mm_hash, req_id)
 
     def free(self, request: Request) -> None:
         """Free all encoder input cache reference held by *request*.
@@ -556,11 +554,9 @@ def compute_mm_encoder_budget(
             scheduler_config.encoder_cache_size,
             max_tokens_per_mm_item
         )
-        logger.warning(f"encoder_compute_budget: {encoder_compute_budget}")
     else:
         # TODO: work this as a soft-cap
         encoder_compute_budget = scheduler_config.max_num_encoder_input_tokens
-        logger.warning(f"encoder_compute_budget - manual: {encoder_compute_budget}")
 
     encoder_cache_size = max(scheduler_config.encoder_cache_size,
                              max_tokens_per_mm_item)

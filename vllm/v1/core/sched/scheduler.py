@@ -354,6 +354,11 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
 
+                # NOTE: ad-hoc handling for setting encode_compute_budget in runtime
+                if request.kv_transfer_params and "encode_compute_budget" in request.kv_transfer_params:
+                    self.encode_compute_budget = request.kv_transfer_params["encode_compute_budget"]
+                    logger.info("set encode_compute_budget to %d", self.encode_compute_budget)
+
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
