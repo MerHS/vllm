@@ -8,11 +8,20 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Iterable
 from functools import cached_property, lru_cache, partial
 from pathlib import Path
-from typing import (Any, Callable, Generic, Literal, Optional, TypeVar, Union,
-                    cast)
+from typing import (
+    Any,
+    Callable,
+    Generic,
+    Literal,
+    Optional,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import jinja2.nodes
 import transformers.utils.chat_template_utils as hf_chat_utils
+
 # yapf conflicts with isort for this block
 # yapf: disable
 from openai.types.chat import (ChatCompletionAssistantMessageParam,
@@ -34,17 +43,25 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 import torch
 # yapf: enable
-from transformers import (PreTrainedTokenizer, PreTrainedTokenizerFast,
-                          ProcessorMixin)
+from transformers import (
+    PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
+    ProcessorMixin,
+)
+
 # pydantic needs the TypedDict from typing_extensions
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models import SupportsMultiModal
-from vllm.multimodal import (MULTIMODAL_REGISTRY, MultiModalDataDict,
-                             MultiModalUUIDDict)
+from vllm.multimodal import (
+    MULTIMODAL_REGISTRY,
+    MultiModalDataDict,
+    MultiModalUUIDDict,
+)
 from vllm.multimodal.utils import MediaConnector
+
 # yapf: disable
 from vllm.transformers_utils.chat_templates import (
     get_chat_template_fallback_path)
@@ -96,8 +113,9 @@ class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     generated and unique for different medias.
     """
 
+
 class ChatCompletionContentPartImageMetaParam(TypedDict, total=False):
-    image_meta: Required[dict[str, Any]] # includes mm_hash, dtype, shape
+    image_meta: Required[dict[str, Any]]  # includes mm_hash, dtype, shape
     """
     The preprocessed dummy image metadata. It can be either:
     - A dictionary where each value is a base64 string.
@@ -109,7 +127,6 @@ class ChatCompletionContentPartImageMetaParam(TypedDict, total=False):
     User-provided UUID of a media. User must guarantee that it is properly
     generated and unique for different medias.
     """
-
 
 
 class VideoURL(TypedDict, total=False):
@@ -306,9 +323,11 @@ def _is_var_access(node: jinja2.nodes.Node, varname: str) -> bool:
 
 def _is_attr_access(node: jinja2.nodes.Node, varname: str, key: str) -> bool:
     if isinstance(node, jinja2.nodes.Getitem):
-        return (_is_var_access(node.node, varname)
-                and isinstance(node.arg, jinja2.nodes.Const)
-                and node.arg.value == key)
+        return (
+            _is_var_access(node.node, varname)
+            and isinstance(node.arg, jinja2.nodes.Const)
+            and node.arg.value == key
+        )
 
     if isinstance(node, jinja2.nodes.Getattr):
         return _is_var_access(node.node, varname) and node.attr == key
@@ -323,12 +342,14 @@ def _is_var_or_elems_access(
 ) -> bool:
     if isinstance(node, jinja2.nodes.Filter):
         return node.node is not None and _is_var_or_elems_access(
-            node.node, varname, key)
+            node.node, varname, key
+        )
     if isinstance(node, jinja2.nodes.Test):
         return _is_var_or_elems_access(node.node, varname, key)
 
     if isinstance(node, jinja2.nodes.Getitem) and isinstance(
-            node.arg, jinja2.nodes.Slice):
+        node.arg, jinja2.nodes.Slice
+    ):
         return _is_var_or_elems_access(node.node, varname, key)
 
     # yapf: disable
@@ -404,6 +425,7 @@ def _try_extract_ast(chat_template: str) -> Optional[jinja2.nodes.Template]:
     except Exception:
         logger.exception("Error when compiling Jinja template")
         return None
+
 
 _PROCESSOR_CHAT_TEMPLATES = dict[tuple[str, bool], Optional[str]]()
 """
@@ -504,8 +526,9 @@ def resolve_hf_chat_template(
 
     # 2nd priority: AutoProcessor chat template, unless tool calling is enabled
     if tools is None:
-        chat_template = _try_get_processor_chat_template(tokenizer,
-                                                         model_config)
+        chat_template = _try_get_processor_chat_template(
+            tokenizer, model_config
+        )
         if chat_template is not None:
             return chat_template
 
@@ -673,7 +696,7 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
         placeholder string to use, if any.
 
         An optional uuid can be added which serves as a unique identifier of the
-        media. 
+        media.
         """
         input_modality = modality.replace("_embeds", "").replace("_meta", "")
         num_items = len(self._items_by_modality[modality]) + 1
@@ -736,7 +759,9 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[object]):
                 )
             mm_inputs["image"] = image_embeds_lst[0]
         if "image_meta" in items_by_modality:
-            mm_inputs["image"] = items_by_modality["image_meta"]  # A list of images
+            mm_inputs["image"] = items_by_modality[
+                "image_meta"
+            ]  # A list of images
         if "image" in items_by_modality:
             mm_inputs["image"] = items_by_modality["image"]  # A list of images
         if "audio" in items_by_modality:
@@ -772,7 +797,9 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
                 )
             mm_inputs["image"] = image_embeds_lst[0]
         if "image_meta" in items_by_modality:
-            mm_inputs["image"] = items_by_modality["image_meta"]  # A list of images
+            mm_inputs["image"] = items_by_modality[
+                "image_meta"
+            ]  # A list of images
         if "image" in items_by_modality:
             mm_inputs["image"] = items_by_modality["image"]  # A list of images
         if "audio" in items_by_modality:
@@ -890,9 +917,9 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         image_meta: dict[str, Any],
         uuid: Optional[str] = None,
     ) -> None:
-        shape = (image_meta['token_len'], self._hidden_size)
+        shape = (image_meta["token_len"], self._hidden_size)
         image_embeds = torch.zeros(shape, dtype=self._dtype)
-        image_grid_thw = image_meta.get('image_grid_thw', None)
+        image_grid_thw = image_meta.get("image_grid_thw", None)
 
         if image_grid_thw is not None:
             embeds = dict(
@@ -902,7 +929,9 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         else:
             embeds = image_embeds
 
-        placeholder = self._tracker.add("image_meta", embeds, image_meta['mm_hash'])
+        placeholder = self._tracker.add(
+            "image_meta", embeds, image_meta["mm_hash"]
+        )
 
         self._add_placeholder("image", placeholder)
 
@@ -980,9 +1009,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
     ) -> None:
         future: asyncio.Future[dict[str, Any]] = asyncio.Future()
 
-        shape = (image_meta['token_len'], self._hidden_size)
+        shape = (image_meta["token_len"], self._hidden_size)
         image_embeds = torch.zeros(shape, dtype=self._dtype)
-        image_grid_thw = image_meta.get('image_grid_thw', None)
+        image_grid_thw = image_meta.get("image_grid_thw", None)
 
         if image_grid_thw is not None:
             embeds = dict(
@@ -994,7 +1023,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
 
         future.set_result(embeds)
 
-        placeholder = self._tracker.add("image_meta", future, image_meta["mm_hash"])
+        placeholder = self._tracker.add(
+            "image_meta", future, image_meta["mm_hash"]
+        )
         self._add_placeholder("image", placeholder)
 
     def parse_image_pil(
@@ -1201,9 +1232,7 @@ MM_PARSER_MAP: dict[
     "image_embeds": lambda part: _ImageEmbedsParser(part).get(
         "image_embeds", None
     ),
-    "image_meta": lambda part: _ImageMetaParser(part).get(
-        "image_meta", None
-    ),
+    "image_meta": lambda part: _ImageMetaParser(part).get("image_meta", None),
     "image_pil": lambda part: _PILImageParser(part).get("image_pil", None),
     "audio_url": lambda part: _AudioParser(part)
     .get("audio_url", {})
