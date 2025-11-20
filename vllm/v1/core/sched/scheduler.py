@@ -248,6 +248,8 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        change_max_num = None
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -402,18 +404,41 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
 
-                # NOTE: ad-hoc handling for setting encode_compute_budget in runtime
-                if (
-                    request.kv_transfer_params
-                    and "encode_compute_budget" in request.kv_transfer_params
-                ):
-                    self.encode_compute_budget = request.kv_transfer_params[
-                        "encode_compute_budget"
-                    ]
-                    logger.info(
-                        "set encode_compute_budget to %d",
-                        self.encode_compute_budget,
-                    )
+                # NOTE(vlaze): ad-hoc handling for setting encode_compute_budget in runtime
+                if request.kv_transfer_params:
+                    if "encode_budget" in request.kv_transfer_params:
+                        self.max_num_encoder_input_tokens = int(
+                            request.kv_transfer_params["encode_budget"]
+                        )
+                        logger.info(
+                            "set max_num_encoder_input_tokens to %d",
+                            self.max_num_encoder_input_tokens,
+                        )
+                    elif "max_num_seqs" in request.kv_transfer_params:
+                        self.max_num_running_reqs = int(
+                            request.kv_transfer_params["max_num_seqs"]
+                        )
+                        logger.info(
+                            "set max_num_running_reqs to %d",
+                            self.max_num_running_reqs,
+                        )
+                    elif (
+                        "max_num_scheduled_tokens" in request.kv_transfer_params
+                    ):
+                        change_max_num = int(
+                            request.kv_transfer_params[
+                                "max_num_scheduled_tokens"
+                            ]
+                        )
+                        logger.info(
+                            "set max_num_scheduled_tokens to %d",
+                            request.kv_transfer_params[
+                                "max_num_scheduled_tokens"
+                            ],
+                        )
+                    elif "show_info" in request.kv_transfer_params:
+                        # get the number of tokens
+                        logger.info("request tokens: %s", request.num_tokens)
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -835,6 +860,10 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+
+        if change_max_num:
+            self.max_num_scheduled_tokens = change_max_num
+
         return scheduler_output
 
     def schedule_encoder_only(self) -> SchedulerOutput:
@@ -927,6 +956,37 @@ class Scheduler(SchedulerInterface):
                 break
 
             request = self.waiting.peek_request()
+
+            # NOTE(vlaze): ad-hoc handling for setting encode_compute_budget in runtime
+            if request.kv_transfer_params:
+                if "encode_budget" in request.kv_transfer_params:
+                    self.max_num_encoder_input_tokens = int(
+                        request.kv_transfer_params["encode_budget"]
+                    )
+                    logger.info(
+                        "set max_num_encoder_input_tokens to %d",
+                        self.max_num_encoder_input_tokens,
+                    )
+                elif "max_num_seqs" in request.kv_transfer_params:
+                    self.max_num_running_reqs = int(
+                        request.kv_transfer_params["max_num_seqs"]
+                    )
+                    logger.info(
+                        "set max_num_running_reqs to %d",
+                        self.max_num_running_reqs,
+                    )
+                elif "max_num_scheduled_tokens" in request.kv_transfer_params:
+                    self.max_num_scheduled_tokens = int(
+                        request.kv_transfer_params["max_num_scheduled_tokens"]
+                    )
+                    logger.info(
+                        "set max_num_scheduled_tokens to %d",
+                        self.max_num_scheduled_tokens,
+                    )
+                elif "show_info" in request.kv_transfer_params:
+                    logger.warning(
+                        "encoder tokens: %s", request.get_num_encoder_tokens(0)
+                    )
 
             encoder_inputs_to_schedule = None
             new_encoder_compute_budget = encoder_compute_budget

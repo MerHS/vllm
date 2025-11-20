@@ -146,7 +146,6 @@ if TYPE_CHECKING:
 
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.core.encoder_cache_manager import MemorySegment
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
@@ -1617,7 +1616,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     embed_key = key
                     break
             if embed_key is not None:
-                logger.warning("mm_hash: %s, embed_key: %s", mm_hash, embed_key)
                 # add embed value in cache
                 output = mm_kwarg[embed_key].data.to(device=self.device)
                 self.encoder_cache[mm_hash] = scatter_mm_placeholders(
@@ -1699,13 +1697,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Cache the encoder outputs by mm_hash
         for (mm_hash, pos_info), output in zip(mm_hashes_pos, output_views):
-            logger.warning(
-                "mm_hash: %s, output.shape: %s, value: %s, sum: %s",
-                mm_hash,
-                output.shape,
-                output[-3:, :3],
-                output[1:-1].sum(),
-            )
             self.encoder_cache[mm_hash] = output
 
     def _gather_mm_embeddings(
@@ -1747,14 +1738,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 mm_hash = mm_hashes[i]
                 encoder_output = self.encoder_cache.get(mm_hash, None)
-
-                logger.warning(
-                    "enc_output mm_hash: %s, shape: %s, value: %s, sum: %s",
-                    mm_hash,
-                    encoder_output.shape,
-                    encoder_output[-3:, :3],
-                    encoder_output[1:-1].sum(),
-                )
 
                 assert encoder_output is not None, (
                     f"Encoder cache miss for {mm_hash}."
@@ -2439,12 +2422,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 scheduler_output
             ) as kv_connector_output,
         ):
-            logger.warning(
-                "inputs_embeds shape: %s, value: %s, sum: %s",
-                inputs_embeds.shape,
-                inputs_embeds[-3:, :3],
-                inputs_embeds[1:-1].sum(),
-            )
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,

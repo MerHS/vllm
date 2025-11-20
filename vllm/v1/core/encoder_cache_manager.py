@@ -470,8 +470,6 @@ class EncoderBlockCacheManager(EncoderCacheManager):
             self.free_segments_by_addr.add(segment)
             self.free_segments_by_size.add(segment)
 
-        logger.warning("evict mm_hash: %s, segments: %s", mm_hash, segments)
-
         self._coalesce_free_segments()
 
 
