@@ -1595,37 +1595,42 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
         # Batch the multi-modal inputs using the helper method.
-        mm_kwargs_all, mm_hashes_pos_all = self._batch_mm_kwargs_from_scheduler(
+        mm_kwargs, mm_hashes_pos = self._batch_mm_kwargs_from_scheduler(
             scheduler_output
         )
 
-        if not mm_kwargs_all:
+        if not mm_kwargs:
             return [], []
 
         # NOTE: raw embed values must not be attached in mm_kwargs in EPD disaggregation
         # since they should be already in multi-modal cache.
         # This is just for safe guard when timeout.
-        mm_kwargs = []
-        mm_hashes_pos = []
-        for mm_kwarg, (mm_hash, pos_info) in zip(
-            mm_kwargs_all, mm_hashes_pos_all
-        ):
-            embed_key = None
-            for key in mm_kwarg.keys():
-                if key.endswith("_embeds"):
-                    embed_key = key
-                    break
-            if embed_key is not None:
-                # add embed value in cache
-                output = mm_kwarg[embed_key].data.to(device=self.device)
-                self.encoder_cache[mm_hash] = scatter_mm_placeholders(
-                    output,
-                    is_embed=pos_info.is_embed,
-                )
-                continue
+        # mm_kwargs = []
+        # mm_hashes_pos = []
+        # for mm_kwarg, (mm_hash, pos_info) in zip(
+        #     mm_kwargs_all, mm_hashes_pos_all
+        # ):
+        #     embed_key = None
+        #     for k, v in mm_kwarg.items():
+        #         if hasattr(v, "data") and torch.is_tensor(v.data):
+        #             logger.warning("mm_kwarg: %s, %s", k, v.data.shape)
+        #         else:
+        #             logger.warning("mm_kwarg: %s, %s", k, v)
+        #     for key in mm_kwarg.keys():
+        #         if key.endswith("_embeds"):
+        #             embed_key = key
+        #             break
+        #     if embed_key is not None:
+        #         # add embed value in cache
+        #         output = mm_kwarg[embed_key].data.to(device=self.device)
+        #         self.encoder_cache[mm_hash] = scatter_mm_placeholders(
+        #             output,
+        #             is_embed=pos_info.is_embed,
+        #         )
+        #         continue
 
-            mm_kwargs.append(mm_kwarg)
-            mm_hashes_pos.append((mm_hash, pos_info))
+        #     mm_kwargs.append(mm_kwarg)
+        #     mm_hashes_pos.append((mm_hash, pos_info))
 
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
