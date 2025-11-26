@@ -14,6 +14,7 @@ generation. Supported dataset types include:
 
 import ast
 import base64
+import csv
 import io
 import json
 import logging
@@ -82,6 +83,8 @@ class SampleRequest:
     )
     lora_request: Optional[LoRARequest] = None
     request_id: Optional[str] = None
+    request_time: Optional[float] = None
+    multi_modal_lens: Optional[list[int]] = None
 
 
 # -----------------------------------------------------------------------------
@@ -984,6 +987,7 @@ class RandomMultiModalDataset(RandomDataset):
         self,
         tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
+        dataset_path: str,
         request_id_prefix: str = "",
         no_oversample: bool = False,
         prefix_len: int = RandomDataset.DEFAULT_PREFIX_LEN,
@@ -1009,46 +1013,71 @@ class RandomMultiModalDataset(RandomDataset):
                 "Video sampling not implemented; set its probability to 0."
             )
 
-        # Get the sampling parameters for the dataset
-        input_lens, output_lens, offsets = self.get_sampling_params(
-            num_requests, range_ratio, input_len, output_len, tokenizer
-        )
+        # Load the csv dataset
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
 
-        (
-            min_num_mm_items,
-            max_num_mm_items,
-            limit_mm_per_prompt,
-            bucket_config,
-        ) = self.get_mm_item_sampling_params(
-            base_items_per_request,
-            num_mm_items_range_ratio,
-            limit_mm_per_prompt,
-            bucket_config,
-        )
+        with open(self.dataset_path) as f:
+            reader = csv.reader(f)
+            raw_dataset = []
+
+            for (
+                req_id,
+                timestamp,
+                input_len,
+                image_list,
+                near_image_list,
+                image_res_list,
+                audio_list,
+                video_list,
+                output_len,
+            ) in reader:
+                raw_dataset.append(
+                    (
+                        int(req_id),
+                        float(timestamp),
+                        int(input_len),
+                        ast.literal_eval(image_list),
+                        ast.literal_eval(near_image_list),
+                        ast.literal_eval(image_res_list),
+                        ast.literal_eval(audio_list),
+                        ast.literal_eval(video_list),
+                        int(output_len),
+                    )
+                )
+
+        num_special_tokens = int(tokenizer.num_special_tokens_to_add())
+        offsets = self._rng.integers(0, tokenizer.vocab_size, size=num_requests)
 
         # Generate prefix once
         prefix_token_ids = self.get_prefix(tokenizer, prefix_len)
         vocab_size = tokenizer.vocab_size
         # Add synthetic multimodal items to each request
         mm_requests = []
-        for i in range(num_requests):
+        for (
+            req_id,
+            timestamp,
+            input_len,
+            image_list,
+            near_image_list,
+            image_res_list,
+            audio_list,
+            video_list,
+            output_len,
+        ), offset in zip(raw_dataset, offsets):
             prompt, total_input_len = self.generate_token_sequence(
                 tokenizer=tokenizer,
                 prefix_token_ids=prefix_token_ids,
                 prefix_len=prefix_len,
                 vocab_size=vocab_size,
-                input_len=int(input_lens[i]),
-                offset=int(offsets[i]),
-                index=i,
-            )
-            # Get multimodal item iterator for a given request
-            mm_item_iterator = self.get_mm_item_iterator(
-                min_num_mm_items,
-                max_num_mm_items,
-                bucket_config,
-                limit_mm_per_prompt,
+                input_len=max(0, int(input_len) - num_special_tokens),
+                offset=offset,
+                index=req_id,
             )
 
+            mm_item_iterator = [(h, w, 1) for (h, w) in image_res_list]
+
+            # item_config: list of (height, width, frame)
             mm_content = cast(
                 list[dict[str, Any]],
                 [
@@ -1067,17 +1096,21 @@ class RandomMultiModalDataset(RandomDataset):
                 sample_request = SampleRequest(
                     prompt=mm_chat_prompt,
                     prompt_len=total_input_len,
-                    expected_output_len=int(output_lens[i]),
+                    expected_output_len=int(output_len),
                     multi_modal_data=None,
-                    request_id=request_id_prefix + str(i),
+                    request_id=request_id_prefix + str(req_id),
+                    request_time=timestamp,
+                    multi_modal_lens=near_image_list,
                 )
             else:
                 sample_request = SampleRequest(
                     prompt=prompt,
                     prompt_len=total_input_len,
-                    expected_output_len=int(output_lens[i]),
+                    expected_output_len=int(output_len),
                     multi_modal_data=mm_content,
-                    request_id=request_id_prefix + str(i),
+                    request_id=request_id_prefix + str(req_id),
+                    request_time=timestamp,
+                    multi_modal_lens=near_image_list,
                 )
             mm_requests.append(sample_request)
         return mm_requests

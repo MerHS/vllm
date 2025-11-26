@@ -188,6 +188,8 @@ async def maybe_prefill(
     - Else, skip and return the original request data for decode
     """
     if p_url:
+        kv_params["do_remote_decode"] = True
+
         prefill_response = await process_prefill_stage(
             req_data, kv_params, p_url, req_id
         )
@@ -214,7 +216,7 @@ async def process_prefill_stage(
     req_id: str,
 ) -> dict:
     """Process request through Prefill stage and return kv_transfer_params"""
-    logger.debug(f"Processing through prefill for req_id: {req_id}/ url: {p_url}")
+    logger.debug("Processing through prefill for req_id: %s/ url: %s", req_id, p_url)
 
     stream = req_data.get("stream", None)
     max_tokens = req_data.get("max_tokens", None)
@@ -246,7 +248,7 @@ async def process_prefill_stage(
                 status_code=prefill_response.status,
                 detail={"error": "Prefill request failed", "message": error_text},
             )
-        logger.debug(f"Prefill processing completed successfully for req_id: {req_id}")
+        logger.debug("Prefill processing completed successfully for req_id: %s", req_id)
 
         req_data["stream"] = stream
         req_data["max_tokens"] = max_tokens
@@ -256,7 +258,7 @@ async def process_prefill_stage(
         return prefill_response
 
     except Exception as e:
-        logger.error(f"Prefill processing failed: {e}")
+        logger.error("Prefill processing failed: %s", e)
         raise HTTPException(
             status_code=500,
             detail={"error": "Prefill processing error", "message": str(e)},
@@ -313,11 +315,21 @@ async def forward_ep(req_data, req_id: str, e_url: str, p_url: str):
 async def forward_non_stream(
     req_data: dict, req_id: str, e_url: str, p_url: str, d_url: str
 ) -> dict:
+    start_time = time.perf_counter()
     req_data = await forward_ep(req_data, req_id, e_url, p_url)
+    duration = time.perf_counter() - start_time
 
     # Step 3: Process through Decode instance
-    logger.debug(f"Getting response from decode for req_id: {req_id}/ url: {d_url}")
     headers = {"x-request-id": req_id}
+
+    logger.info("kv_transfer_params: %s", req_data["kv_transfer_params"])
+    logger.info(
+        "Streaming response from decode for req_id: %s / e_url: %s, d_url: %s / encoder duration: %s",
+        req_id,
+        e_url,
+        d_url,
+        duration * 1000,
+    )
 
     # Non-streaming response
     async with decode_session.post(
@@ -337,7 +349,12 @@ async def forward_stream(
     duration = time.perf_counter() - start_time
     # Step 3: Process through Decode instance
     logger.info(
-        f"Streaming response from decode for req_id: {req_id} / e_url: {e_url}, d_url: {d_url} / encoder duration: {duration * 1000:.2f} / len: {img_len}"
+        "Streaming response from decode for req_id: %s / e_url: %s, d_url: %s / encoder duration: %s / len: %s",
+        req_id,
+        e_url,
+        d_url,
+        duration * 1000,
+        img_len,
     )
     headers = {"x-request-id": req_id}
 
@@ -357,6 +374,8 @@ async def forward_stream(
 # Public routes
 ###############################################################################
 
+BASE_TIME = time.time()
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -364,6 +383,10 @@ async def chat_completions(request: Request):
 
     req_data = await request.json()
     req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    req_mm_len = request.headers.get("x-multimodal-len", None)
+
+    logger.info("Request multimodal len: %s", req_mm_len)
+    logger.info("Request data: %s, %s", req_id, time.time() - BASE_TIME)
 
     img_len = 0
     for ctn in req_data["messages"][0]["content"]:

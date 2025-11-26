@@ -612,6 +612,7 @@ class Scheduler(SchedulerInterface):
                 # All the remote encoder inputs must be allocated in the same time
                 if remote_encoder_inputs:
                     num_remote_tokens = 0
+                    break_alloc = False
                     for remote_input_id in remote_encoder_inputs:
                         self.encoder_cache_manager.check_and_update_cache(
                             request, remote_input_id
@@ -619,19 +620,14 @@ class Scheduler(SchedulerInterface):
                         can_alloc = self.encoder_cache_manager.can_allocate(
                             request,
                             remote_input_id,
-                            encoder_compute_budget,
+                            2**63 - 1,  # only cosider the free slots
                             num_remote_tokens,
                         )
 
                         # Not enough space: defer allocation
                         if not can_alloc:
-                            logger.warning(
-                                "not enough space in the encoder cache for remote encoder input %s",
-                                remote_input_id,
-                            )
-                            self.waiting.pop_request()
-                            skipped_waiting_requests.prepend_request(request)
-                            continue
+                            break_alloc = True
+                            break
 
                         num_remote_tokens += request.mm_positions[
                             remote_input_id
@@ -647,6 +643,16 @@ class Scheduler(SchedulerInterface):
                             request.get_num_encoder_tokens(remote_input_id),
                             self.encoder_cache_manager.get_segments(mm_hash),
                         )
+
+                    if break_alloc:
+                        logger.warning(
+                            "not enough space in the encoder cache for remote encoder input %s, %s",
+                            remote_input_id,
+                            request.request_id,
+                        )
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an

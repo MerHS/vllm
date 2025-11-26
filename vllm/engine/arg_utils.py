@@ -865,6 +865,8 @@ class EngineArgs:
                                      **scheduler_kwargs["cuda_graph_sizes"])
         scheduler_group.add_argument('--max-num-encoder-input-tokens',
                                      **scheduler_kwargs["max_num_encoder_input_tokens"])
+        scheduler_group.add_argument('--encoder-cache-size',
+                                     **scheduler_kwargs["encoder_cache_size"])
         scheduler_group.add_argument(
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"])

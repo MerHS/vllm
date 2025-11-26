@@ -214,8 +214,20 @@ async def get_request(
         delay_ts = [delay * normalize_factor for delay in delay_ts]
 
     start_ts = time.time()
+    base_time = None
     for request_index, request in enumerate(input_requests):
-        if delay_ts[request_index] > 0:
+        if request.request_time is not None:
+            if base_time is None:
+                base_time = (time.time(), request.request_time)
+
+            current_time = time.time()
+            time_diff = current_time - base_time[0]
+            req_diff = request.request_time - base_time[1]
+            if time_diff < req_diff:
+                sleep_interval_s = req_diff - time_diff
+                if sleep_interval_s > 0:
+                    await asyncio.sleep(sleep_interval_s)
+        elif delay_ts[request_index] > 0:
             current_ts = time.time()
             sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
             if sleep_interval_s > 0:
@@ -621,6 +633,7 @@ async def benchmark(
             ignore_eos=ignore_eos,
             extra_body=extra_body,
             request_id=request_id,
+            multi_modal_lens=request.multi_modal_lens,
         )
         tasks.append(
             asyncio.create_task(

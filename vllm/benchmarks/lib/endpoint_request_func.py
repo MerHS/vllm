@@ -74,6 +74,7 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: Optional[str] = None
     request_id: Optional[str] = None
+    multi_modal_lens: Optional[list[int]] = None
 
 
 @dataclass
@@ -261,6 +262,8 @@ async def async_request_openai_chat_completions(
     }
     if request_func_input.request_id:
         headers["x-request-id"] = request_func_input.request_id
+    if request_func_input.multi_modal_lens:
+        headers["x-request-lens"] = str(request_func_input.multi_modal_lens)
 
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
